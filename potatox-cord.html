@@ -1,0 +1,1498 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>POTATOX CORD</title>
+
+<!-- Tailwind (CDN, JIT runtime) -->
+<script src="https://cdn.tailwindcss.com"></script>
+
+<!-- Babel Standalone (JSX transform in-browser) -->
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+
+<!-- Import map: bare specifiers -> ESM CDN builds -->
+<script type="importmap">
+{
+  "imports": {
+    "react": "https://esm.sh/react@18.2.0",
+    "react/jsx-runtime": "https://esm.sh/react@18.2.0/jsx-runtime",
+    "react-dom": "https://esm.sh/react-dom@18.2.0",
+    "react-dom/client": "https://esm.sh/react-dom@18.2.0/client",
+    "lucide-react": "https://esm.sh/lucide-react@0.344.0?external=react",
+    "firebase/app": "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js",
+    "firebase/firestore": "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js",
+    "firebase/auth": "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js"
+  }
+}
+</script>
+
+<style>
+  html, body, #root { height: 100%; margin: 0; padding: 0; background: #36393f; }
+  * { box-sizing: border-box; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+
+<script type="text/babel" data-type="module" data-presets="react" id="app-source">
+import React, { useState, useEffect, useRef } from 'react';
+import { createRoot } from 'react-dom/client';
+import {
+  Hash, Settings, LogOut, Send, Plus, Users, MessageSquare,
+  Activity, Trash2, ShieldAlert, Crown, Image as ImageIcon,
+  Mic, MicOff, Square, PhoneCall, AlertTriangle, CheckSquare, Square as SquareOutline,
+  Volume2, Terminal, X, Lock, User, LayoutDashboard, Gavel, BarChart2, Info, Loader2,
+  Star, FileText
+} from 'lucide-react';
+
+// Firebase設定
+import { initializeApp } from 'firebase/app';
+import {
+  initializeFirestore,
+  persistentLocalCache,
+  persistentMultipleTabManager,
+  doc, setDoc, getDoc, collection, onSnapshot, addDoc, serverTimestamp, deleteDoc, updateDoc
+} from 'firebase/firestore';
+import { getAuth, signInAnonymously, onAuthStateChanged, signInWithCustomToken } from 'firebase/auth';
+
+const firebaseConfig = {
+  apiKey: "AIzaSyB2901UqScS9nH7_C3a2zNOf-0xIlo9tvY",
+  authDomain: "potatoxapp.firebaseapp.com",
+  projectId: "potatoxapp",
+  storageBucket: "potatoxapp.firebasestorage.app",
+  messagingSenderId: "345400459865",
+  appId: "1:345400459865:web:d0f22e2a728133fe23e748"
+};
+
+const app = initializeApp(firebaseConfig);
+const auth = getAuth(app);
+const db = initializeFirestore(app, {
+  localCache: persistentLocalCache({ tabManager: persistentMultipleTabManager() })
+});
+
+const MAIN_APP_ID = 'e17dca5aa1bb-App.jsx-30'; 
+const CORD_APP_ID = 'e17dca5aa1bb-Cord-01'; 
+
+// --- 音声合成エンジン (入室・退出音) ---
+const playSound = (type) => {
+  try {
+    const ctx = new (window.AudioContext || window.webkitAudioContext)();
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.connect(gain); gain.connect(ctx.destination);
+    osc.type = 'sine';
+    if (type === 'join') {
+      osc.frequency.setValueAtTime(440, ctx.currentTime);
+      osc.frequency.exponentialRampToValueAtTime(880, ctx.currentTime + 0.1);
+    } else {
+      osc.frequency.setValueAtTime(880, ctx.currentTime);
+      osc.frequency.exponentialRampToValueAtTime(440, ctx.currentTime + 0.1);
+    }
+    gain.gain.setValueAtTime(0, ctx.currentTime);
+    gain.gain.linearRampToValueAtTime(0.05, ctx.currentTime + 0.05);
+    gain.gain.linearRampToValueAtTime(0, ctx.currentTime + 0.15);
+    osc.start(ctx.currentTime); osc.stop(ctx.currentTime + 0.2);
+  } catch(e){}
+};
+
+function PotatoxCordApp() {
+  const [user, setUser] = useState(null);
+  const [profile, setProfile] = useState(null);
+  const [isCheckingAuth, setIsCheckingAuth] = useState(true);
+  const [loginForm, setLoginForm] = useState({ username: '', password: '' });
+  const [authError, setAuthError] = useState('');
+
+  const [channels, setChannels] = useState([]);
+  const [activeChannel, setActiveChannel] = useState(null);
+  const [messages, setMessages] = useState([]);
+  const [members, setMembers] = useState([]);
+  const [presence, setPresence] = useState({});
+  const [typings, setTypings] = useState([]);
+  
+  const [chatInput, setChatInput] = useState('');
+  const [showNewChannel, setShowNewChannel] = useState(false);
+  const [newChannelName, setNewChannelName] = useState('');
+  const [newChannelType, setNewChannelType] = useState('text');
+  const [newChannelAllowedRoles, setNewChannelAllowedRoles] = useState(['owner', 'admin', 'op', 'mod', 'premium', 'user']);
+  
+  // ボイスメッセージ関連
+  const [isRecording, setIsRecording] = useState(false);
+  const mediaRecorderRef = useRef(null);
+  const audioChunksRef = useRef([]);
+
+  // ガチ通話 (Voice Room) 関連 States
+  const [hasVoiceConsent, setHasVoiceConsent] = useState(false);
+  const [showConsentModal, setShowConsentModal] = useState(false);
+  const [consentChecks, setConsentChecks] = useState([false, false, false]);
+  
+  const [currentVoiceChannel, setCurrentVoiceChannel] = useState(null);
+  const currentVoiceChannelRef = useRef(null);
+  const [voiceParticipants, setVoiceParticipants] = useState([]);
+  const [speakingUsers, setSpeakingUsers] = useState({});
+  const [latestVoiceData, setLatestVoiceData] = useState({}); 
+  
+  // 🔥 マイクミュート関連 State & Ref
+  const [isMuted, setIsMuted] = useState(false);
+  const isMutedRef = useRef(false);
+
+  const voiceRecorderRef = useRef(null);
+  const voiceStreamRef = useRef(null);
+  const pendingJoinChannelRef = useRef(null);
+
+  const messagesEndRef = useRef(null);
+  const prevPresenceRef = useRef({});
+
+  // ターミナル関連
+  const [showTerminal, setShowTerminal] = useState(false);
+  const [terminalHistory, setTerminalHistory] = useState([
+     { text: 'POTATOX TERMINAL OS v1.0.0 initialized.', type: 'system' },
+     { text: 'Type "help" for a list of commands.', type: 'system' }
+  ]);
+  const [terminalInput, setTerminalInput] = useState('');
+  const [terminalMode, setTerminalMode] = useState('standard');
+  const terminalEndRef = useRef(null);
+
+  // 厳重同意プロトコル項目
+  const [consentItems, setConsentItems] = useState([
+     "マイクへのアクセスと音声の録音・リアルタイム送信を許可します。",
+     "通話中、自身の音声データが2秒ごとに上書き更新され、過去のデータが残らないことに同意します。",
+     "不適切な発言を行わず、帝国の規律に従うことを誓約します。"
+  ]);
+
+  // 🔥 ドラッグ可能なPotatoxウィンドウ関連 States (互換性維持のため残存) 🔥
+  const [showPotatox, setShowPotatox] = useState(false);
+  const [potatoxPos, setPotatoxPos] = useState({ x: 100, y: 100 });
+  const [isDraggingWindow, setIsDraggingWindow] = useState(false);
+  const dragOffsetRef = useRef({ x: 0, y: 0 });
+  const [potatoxUrl, setPotatoxUrl] = useState('');
+
+  // 👑 PX Admin パネル State 👑
+  const [showPXAdmin, setShowPXAdmin] = useState(false);
+  const [pxAdminTab, setPxAdminTab] = useState('home');
+  const [globalMediaData, setGlobalMediaData] = useState(null);
+
+  // 🌟 システム設定（URL & グローバルイベント）をFirestoreから監視する 🌟
+  useEffect(() => {
+    if (!profile) return;
+    const sysDocRef = doc(db, 'artifacts', CORD_APP_ID, 'public', 'data', 'settings', 'system');
+    const unsubSys = onSnapshot(sysDocRef, (docSnap) => {
+      if (docSnap.exists()) {
+        const data = docSnap.data();
+        if (data.potatoxUrl) {
+          setPotatoxUrl(data.potatoxUrl);
+        }
+        
+        setGlobalMediaData(data.globalMedia || null);
+        
+        // 🔥 グローバルイベント処理（全ユーザー同期エフェクト） 🔥
+        if (data.globalEvent) {
+             const ev = data.globalEvent;
+             // リセット処理（全エフェクト強制解除）
+             document.body.className = '';
+             document.body.style = '';
+             document.title = "POTATOX CORD";
+             
+             // 小さな変化 (0-9)
+             if (ev === 'event_0') document.title = "POTATOX - HACKED";
+             if (ev === 'event_1') console.log("にゃーん 🐱");
+             if (ev === 'event_2') document.body.style.filter = "sepia(0.3)";
+             if (ev === 'event_3') document.body.style.filter = "hue-rotate(45deg)";
+             if (ev === 'event_4') document.body.style.filter = "blur(0.5px)";
+             if (ev === 'event_5') document.body.style.transform = "rotate(1deg)";
+             if (ev === 'event_6') document.body.style.transform = "rotate(-1deg)";
+             if (ev === 'event_7') document.body.style.cursor = "crosshair";
+             if (ev === 'event_8') document.body.style.fontFamily = "serif";
+             if (ev === 'event_9') playSound('join');
+             
+             // ド派手な変化 (10-19)
+             if (ev === 'event_10') document.body.classList.add('global-spin');
+             if (ev === 'event_11') document.body.classList.add('global-shake');
+             if (ev === 'event_12') document.body.classList.add('global-rainbow');
+             if (ev === 'event_13') document.body.classList.add('global-upsidedown');
+             if (ev === 'event_14') document.body.classList.add('global-mindblown');
+             if (ev === 'event_15') document.body.classList.add('global-flash-invert');
+             if (ev === 'event_16') document.body.classList.add('global-stretch');
+             if (ev === 'event_17') document.body.classList.add('global-blackout');
+             if (ev === 'event_18') document.body.classList.add('global-crabwalk');
+             if (ev === 'event_19') document.body.classList.add('global-explosion');
+             if (ev === 'event_20') document.body.classList.add('global-kyoshiki-murasaki');
+        }
+      }
+    }, (error) => {
+      console.error("システム設定の読み込みエラーや！:", error);
+    });
+    return () => unsubSys();
+  }, [profile]);
+
+  // --- 🔥 ドラッグウィンドウ処理 (互換性維持) 🔥 ---
+  useEffect(() => {
+    const handleMouseMove = (e) => {
+      if (!isDraggingWindow) return;
+      setPotatoxPos({
+        x: e.clientX - dragOffsetRef.current.x,
+        y: e.clientY - dragOffsetRef.current.y
+      });
+    };
+    const handleMouseUp = () => { setIsDraggingWindow(false); };
+    
+    if (isDraggingWindow) {
+      document.addEventListener('mousemove', handleMouseMove);
+      document.addEventListener('mouseup', handleMouseUp);
+    }
+    return () => {
+      document.removeEventListener('mousemove', handleMouseMove);
+      document.removeEventListener('mouseup', handleMouseUp);
+    };
+  }, [isDraggingWindow]);
+
+  const handleWindowMouseDown = (e) => {
+    setIsDraggingWindow(true);
+    dragOffsetRef.current = {
+      x: e.clientX - potatoxPos.x,
+      y: e.clientY - potatoxPos.y
+    };
+  };
+
+  // --- Auth & Initial Sync ---
+  const [authDebugMsg, setAuthDebugMsg] = useState('');
+  useEffect(() => {
+    let isMounted = true;
+    let settled = false;
+
+    const timeoutId = setTimeout(() => {
+      if (!settled && isMounted) {
+        setAuthDebugMsg('認証がタイムアウトしました。ネットワーク接続、またはブラウザのプライベートブラウジング/トラッキング防止設定をご確認ください。');
+      }
+    }, 8000);
+
+    const initAuth = async () => {
+      try {
+        if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+          await signInWithCustomToken(auth, __initial_auth_token).catch(() => signInAnonymously(auth));
+        } else {
+          await signInAnonymously(auth);
+        }
+      } catch (e) {
+        console.error('Auth error:', e);
+        if (isMounted) setAuthDebugMsg('認証エラー: ' + (e && e.message ? e.message : String(e)));
+        await signInAnonymously(auth).catch((e2) => {
+          console.error('Retry auth error:', e2);
+          if (isMounted) setAuthDebugMsg('認証エラー(再試行): ' + (e2 && e2.message ? e2.message : String(e2)));
+        });
+      }
+      finally {
+        settled = true;
+        clearTimeout(timeoutId);
+        if (isMounted) setIsCheckingAuth(false);
+      }
+    };
+    initAuth();
+
+    const unsubscribe = onAuthStateChanged(auth, async (u) => {
+      if (!isMounted) return;
+      setUser(u);
+      if (u) {
+        const saved = localStorage.getItem('potatox_username');
+        if (saved) {
+          const snap = await getDoc(doc(db, 'artifacts', MAIN_APP_ID, 'public', 'data', 'users', saved));
+          if (snap.exists() && isMounted) setProfile(snap.data());
+        }
+      }
+    });
+    return () => { isMounted = false; unsubscribe(); };
+  }, []);
+
+  // --- Core Sync (Channels, Members, Presence, Typing) ---
+  useEffect(() => {
+    if (!profile) return;
+
+    // チャンネルリスト監視
+    const unsubChannels = onSnapshot(collection(db, 'artifacts', CORD_APP_ID, 'public', 'data', 'channels'), (snap) => {
+      const chs = [];
+      snap.forEach(d => chs.push({ id: d.id, ...d.data() }));
+      chs.sort((a, b) => (a.createdAt?.toMillis?.() || 0) - (b.createdAt?.toMillis?.() || 0));
+      if (chs.length === 0 && profile.role === 'owner') {
+         // 初回起動時にTextとVoiceチャンネルを作成
+         addDoc(collection(db, 'artifacts', CORD_APP_ID, 'public', 'data', 'channels'), { name: 'general', type: 'text', createdAt: serverTimestamp() });
+         addDoc(collection(db, 'artifacts', CORD_APP_ID, 'public', 'data', 'channels'), { name: 'Voice Lounge', type: 'voice', createdAt: serverTimestamp() });
+      } else {
+         setChannels(chs);
+         if (!activeChannel && chs.length > 0) setActiveChannel(chs[0]);
+      }
+    });
+
+    const unsubMembers = onSnapshot(collection(db, 'artifacts', MAIN_APP_ID, 'public', 'data', 'users'), (snap) => {
+      const mems = [];
+      snap.forEach(d => mems.push({ id: d.id, ...d.data() }));
+      mems.sort((a, b) => {
+         const rank = { 'owner': 0, 'admin': 1, 'op': 2, 'mod': 3, 'premium': 4, 'user': 5 };
+         return (rank[a.role] ?? 9) - (rank[b.role] ?? 9) || a.username?.localeCompare(b.username);
+      });
+      setMembers(mems);
+    });
+
+    const unsubPresence = onSnapshot(collection(db, 'artifacts', CORD_APP_ID, 'public', 'data', 'presence'), (snap) => {
+      const pData = {};
+      const now = Date.now();
+      snap.forEach(d => {
+         const data = d.data();
+         if (now - (data.lastActive || 0) < 60000) pData[d.id] = true;
+      });
+      Object.keys(pData).forEach(uid => { if (uid !== profile.username && !prevPresenceRef.current[uid]) playSound('join'); });
+      Object.keys(prevPresenceRef.current).forEach(uid => { if (uid !== profile.username && !pData[uid]) playSound('leave'); });
+      prevPresenceRef.current = pData;
+      setPresence(pData);
+    });
+
+    let unsubTyping = () => {};
+    if (profile.role === 'owner') {
+       unsubTyping = onSnapshot(collection(db, 'artifacts', CORD_APP_ID, 'public', 'data', 'typing'), (snap) => {
+          const t = [];
+          snap.forEach(d => {
+             const data = d.data();
+             if (data.text && Date.now() - (data.timestamp || 0) < 10000) t.push({ id: d.id, ...data });
+          });
+          setTypings(t);
+       });
+    }
+
+    const presenceLoop = setInterval(() => {
+       setDoc(doc(db, 'artifacts', CORD_APP_ID, 'public', 'data', 'presence', profile.username), { lastActive: Date.now() }, { merge: true });
+    }, 20000);
+    setDoc(doc(db, 'artifacts', CORD_APP_ID, 'public', 'data', 'presence', profile.username), { lastActive: Date.now() }, { merge: true });
+
+    const unsubConsent = onSnapshot(doc(db, 'artifacts', CORD_APP_ID, 'public', 'data', 'settings', 'consent'), (snap) => {
+       if (snap.exists()) {
+          const items = snap.data().items || [];
+          setConsentItems(items);
+          setConsentChecks(prev => {
+             const newChecks = [...prev];
+             while(newChecks.length < items.length) newChecks.push(false);
+             return newChecks.slice(0, items.length);
+          });
+       } else {
+          if (profile.role === 'owner') {
+             setDoc(doc(db, 'artifacts', CORD_APP_ID, 'public', 'data', 'settings', 'consent'), {
+                 items: consentItems
+             }).catch(()=>{});
+          } else {
+             setConsentChecks(new Array(consentItems.length).fill(false));
+          }
+       }
+    });
+
+    return () => { unsubChannels(); unsubMembers(); unsubPresence(); unsubTyping(); clearInterval(presenceLoop); unsubConsent(); };
+  }, [profile]); // eslint-disable-line
+
+  // --- Fetch Text Messages ---
+  useEffect(() => {
+    if (!profile || !activeChannel || activeChannel.type === 'voice') return;
+    const messagesCollectionName = `messages_${activeChannel.id}`;
+    
+    const unsubMessages = onSnapshot(collection(db, 'artifacts', CORD_APP_ID, 'public', 'data', messagesCollectionName), (snap) => {
+      const msgs = [];
+      snap.forEach(d => msgs.push({ id: d.id, ...d.data() }));
+      msgs.sort((a, b) => (a.timestamp?.toMillis?.() || 0) - (b.timestamp?.toMillis?.() || 0));
+      setMessages(msgs);
+      setTimeout(() => { if (messagesEndRef.current) messagesEndRef.current.scrollIntoView({ behavior: 'smooth' }) }, 100);
+    });
+    return () => unsubMessages();
+  }, [profile, activeChannel]);
+
+  // --- ガチ通話 (Voice Room) 受信・参加者監視 ---
+  useEffect(() => {
+     if (!profile || !currentVoiceChannel) return;
+
+     // 音声データ受信（クラッシュ防止版）
+     const unsubVoice = onSnapshot(collection(db, 'artifacts', CORD_APP_ID, 'public', 'data', `voice_chunks_${currentVoiceChannel}`), (snap) => {
+        snap.docChanges().forEach(change => {
+           if (change.type === 'added' || change.type === 'modified') {
+              const data = change.doc.data();
+              const senderId = change.doc.id;
+              
+              if (senderId !== profile.username) {
+                 setLatestVoiceData(prev => ({...prev, [senderId]: data.audioData}));
+              }
+           }
+        });
+     });
+
+     // 参加者リストとミュート状態の監視（オブジェクト形式で保存）
+     const unsubParticipants = onSnapshot(collection(db, 'artifacts', CORD_APP_ID, 'public', 'data', `voice_participants_${currentVoiceChannel}`), (snap) => {
+         const parts = [];
+         snap.forEach(d => parts.push({ id: d.id, ...d.data() }));
+         setVoiceParticipants(parts);
+     });
+
+     return () => { unsubVoice(); unsubParticipants(); };
+  }, [profile, currentVoiceChannel]);
+
+  // ページを閉じる・アンマウント時に強制退室
+  useEffect(() => {
+      return () => { if (currentVoiceChannelRef.current) leaveVoiceRoom(); };
+  }, []);
+
+  // --- Handlers ---
+  const handleLogin = async (e) => {
+    e.preventDefault();
+    setAuthError('');
+    try {
+      if (!auth.currentUser) await signInAnonymously(auth);
+      const targetUser = loginForm.username.trim();
+      const snap = await getDoc(doc(db, 'artifacts', MAIN_APP_ID, 'public', 'data', 'users', targetUser));
+      if (!snap.exists()) { setAuthError('IDかパスワードがちゃうで。'); return; }
+      const userData = snap.data();
+      if (userData.password === loginForm.password) {
+        setProfile(userData);
+        localStorage.setItem('potatox_username', userData.username);
+      } else { setAuthError('IDかパスワードがちゃうで。'); }
+    } catch (e) { setAuthError('通信エラーや。'); }
+  };
+
+  const handleLogout = () => {
+     if (currentVoiceChannel) leaveVoiceRoom();
+     localStorage.removeItem('potatox_username');
+     setProfile(null); setActiveChannel(null);
+  };
+
+  const openDM = (targetUsername) => {
+     if (targetUsername === profile.username) return;
+     const dmId = [profile.username, targetUsername].sort().join('_');
+     setActiveChannel({
+        id: `dm_${dmId}`,
+        name: targetUsername,
+        type: 'dm',
+        targetUser: targetUsername
+     });
+     setShowTerminal(false);
+  };
+
+  const handleTyping = (e) => {
+     const val = e.target.value;
+     setChatInput(val);
+     if (!profile) return;
+     setDoc(doc(db, 'artifacts', CORD_APP_ID, 'public', 'data', 'typing', profile.username), {
+        text: val, timestamp: Date.now()
+     }, { merge: true }).catch(()=>{});
+  };
+
+  const sendMessage = async (e, customData = null) => {
+    if (e) e.preventDefault();
+    if ((!chatInput.trim() && !customData) || !activeChannel || activeChannel.type === 'voice') return;
+    
+    const messagesCollectionName = `messages_${activeChannel.id}`;
+    const payload = {
+       text: chatInput, userId: profile.username || 'unknown', role: profile.role || 'user', timestamp: serverTimestamp(), ...customData
+    };
+
+    try {
+       if (customData?.audioBase64) {
+          messages.filter(m => m.audioBase64).forEach(m => {
+             updateDoc(doc(db, 'artifacts', CORD_APP_ID, 'public', 'data', messagesCollectionName, m.id), { audioBase64: null, audioDeleted: true }).catch(()=>{});
+          });
+       }
+       await addDoc(collection(db, 'artifacts', CORD_APP_ID, 'public', 'data', messagesCollectionName), payload);
+       setChatInput('');
+       setDoc(doc(db, 'artifacts', CORD_APP_ID, 'public', 'data', 'typing', profile.username), { text: '', timestamp: Date.now() }, { merge: true });
+    } catch (err) {}
+  };
+
+  const handleImageUpload = (e) => {
+     const file = e.target.files[0];
+     if (!file) return;
+     const reader = new FileReader();
+     reader.onload = (event) => {
+        const img = new Image();
+        img.onload = () => {
+           const canvas = document.createElement('canvas');
+           let width = img.width, height = img.height;
+           if (width > 800) { height *= 800/width; width = 800; }
+           canvas.width = width; canvas.height = height;
+           canvas.getContext('2d').drawImage(img, 0, 0, width, height);
+           sendMessage(null, { imgBase64: canvas.toDataURL('image/jpeg', 0.6) });
+        };
+        img.src = event.target.result;
+     };
+     reader.readAsDataURL(file);
+  };
+
+  const handleAnyFileUpload = (e) => {
+     const file = e.target.files[0];
+     if (!file) return;
+     const reader = new FileReader();
+     reader.onload = (event) => {
+        const base64 = event.target.result;
+        const mimeType = file.type;
+        const fileName = file.name;
+
+        if (mimeType.startsWith('image/')) {
+           const img = new Image();
+           img.onload = () => {
+              const canvas = document.createElement('canvas');
+              let width = img.width, height = img.height;
+              if (width > 800) { height *= 800/width; width = 800; }
+              canvas.width = width; canvas.height = height;
+              canvas.getContext('2d').drawImage(img, 0, 0, width, height);
+              sendMessage(null, { imgBase64: canvas.toDataURL('image/jpeg', 0.6) });
+           };
+           img.src = base64;
+        } else if (mimeType.startsWith('audio/')) {
+           sendMessage(null, { audioBase64: base64, text: `🎵 音声ファイル: ${fileName}` });
+        } else if (mimeType.startsWith('video/')) {
+           sendMessage(null, { videoBase64: base64, text: `🎥 動画ファイル: ${fileName}` });
+        } else {
+           sendMessage(null, { fileBase64: base64, fileName: fileName, text: `📁 ファイル: ${fileName}` });
+        }
+     };
+     reader.readAsDataURL(file);
+  };
+
+  // ボイスメッセージ録音
+  const startRecording = async () => {
+     if (!hasVoiceConsent) { setShowConsentModal(true); return; }
+     try {
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        mediaRecorderRef.current = new MediaRecorder(stream);
+        audioChunksRef.current = [];
+        mediaRecorderRef.current.ondataavailable = e => { if (e.data.size > 0) audioChunksRef.current.push(e.data); };
+        mediaRecorderRef.current.onstop = () => {
+           const mimeType = mediaRecorderRef.current.mimeType || 'audio/webm';
+           const audioBlob = new Blob(audioChunksRef.current, { type: mimeType });
+           const reader = new FileReader();
+           reader.onloadend = () => sendMessage(null, { audioBase64: reader.result, text: '🎤 ボイスメッセージ' });
+           reader.readAsDataURL(audioBlob);
+           stream.getTracks().forEach(track => track.stop());
+        };
+        mediaRecorderRef.current.start();
+        setIsRecording(true);
+     } catch(e) { alert("マイクへのアクセスが拒否されました。"); }
+  };
+
+  const stopRecording = () => {
+     if (mediaRecorderRef.current && isRecording) { mediaRecorderRef.current.stop(); setIsRecording(false); }
+  };
+
+  // --- ガチ通話 (Voice Room) ロジック ---
+  const requestJoinVoiceRoom = (channelId) => {
+      if (!hasVoiceConsent) {
+          pendingJoinChannelRef.current = channelId;
+          setShowConsentModal(true);
+          return;
+      }
+      executeJoinVoiceRoom(channelId);
+  };
+
+  const executeJoinVoiceRoom = async (channelId) => {
+     if (currentVoiceChannel) leaveVoiceRoom();
+     
+     try {
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        voiceStreamRef.current = stream;
+        
+        setIsMuted(false);
+        isMutedRef.current = false;
+
+        await setDoc(doc(db, 'artifacts', CORD_APP_ID, 'public', 'data', `voice_participants_${channelId}`, profile.username), { 
+            joinedAt: serverTimestamp(),
+            isMuted: false 
+        });
+        
+        setCurrentVoiceChannel(channelId);
+        currentVoiceChannelRef.current = channelId;
+
+        const recorder = new MediaRecorder(stream);
+
+        recorder.ondataavailable = async (e) => {
+            if (isMutedRef.current) return;
+
+            if (e.data.size > 0 && currentVoiceChannelRef.current === channelId) {
+                const blob = new Blob([e.data], { type: recorder.mimeType || 'audio/webm' });
+                const reader = new FileReader();
+                reader.onloadend = async () => {
+                   const base64 = reader.result;
+                   try {
+                      await setDoc(doc(db, 'artifacts', CORD_APP_ID, 'public', 'data', `voice_chunks_${channelId}`, profile.username), {
+                         audioData: base64, timestamp: serverTimestamp()
+                      });
+                   } catch(err) {}
+                };
+                reader.readAsDataURL(blob);
+            }
+        };
+
+        recorder.onstop = () => {
+           if (currentVoiceChannelRef.current === channelId) {
+               try {
+                   recorder.start();
+                   if (!isMutedRef.current) setSpeakingUsers(prev => ({...prev, [profile.username]: true}));
+               } catch (err) {}
+           }
+        };
+
+        try { recorder.start(); } catch(err) {}
+        if (!isMutedRef.current) setSpeakingUsers(prev => ({...prev, [profile.username]: true}));
+
+        const recordInterval = setInterval(() => {
+           if (currentVoiceChannelRef.current !== channelId) {
+               clearInterval(recordInterval);
+               return;
+           }
+
+           if (recorder.state === 'recording') {
+               try {
+                   recorder.stop(); 
+                   setSpeakingUsers(prev => ({...prev, [profile.username]: false}));
+               } catch (err) {}
+           }
+        }, 2000); 
+
+        voiceRecorderRef.current = { stop: () => { 
+            clearInterval(recordInterval); 
+            recorder.onstop = null; 
+            if(recorder.state === 'recording') { try { recorder.stop(); } catch(e){} } 
+        } };
+
+     } catch(e) { alert("マイクへのアクセスが拒否されました。設定を確認してや！"); }
+  };
+
+  const toggleMute = async () => {
+      if (!currentVoiceChannelRef.current) return;
+      
+      const newMutedState = !isMuted;
+      setIsMuted(newMutedState);
+      isMutedRef.current = newMutedState; 
+
+      if (voiceStreamRef.current) {
+          voiceStreamRef.current.getAudioTracks().forEach(track => {
+              track.enabled = !newMutedState;
+          });
+      }
+
+      try {
+          await updateDoc(doc(db, 'artifacts', CORD_APP_ID, 'public', 'data', `voice_participants_${currentVoiceChannelRef.current}`, profile.username), {
+              isMuted: newMutedState
+          });
+      } catch(e) {}
+
+      if (newMutedState) {
+          setSpeakingUsers(prev => ({...prev, [profile.username]: false}));
+      }
+  };
+
+  const leaveVoiceRoom = async () => {
+     const chId = currentVoiceChannelRef.current;
+     if (!chId) return;
+
+     if (voiceRecorderRef.current && typeof voiceRecorderRef.current.stop === 'function') {
+        voiceRecorderRef.current.stop();
+     }
+     if (voiceStreamRef.current) {
+        voiceStreamRef.current.getTracks().forEach(track => track.stop());
+     }
+     
+     setCurrentVoiceChannel(null);
+     currentVoiceChannelRef.current = null;
+     setIsMuted(false);
+     isMutedRef.current = false;
+     setLatestVoiceData({});
+     setSpeakingUsers({});
+
+     try {
+         await deleteDoc(doc(db, 'artifacts', CORD_APP_ID, 'public', 'data', `voice_participants_${chId}`, profile.username));
+         await deleteDoc(doc(db, 'artifacts', CORD_APP_ID, 'public', 'data', `voice_chunks_${chId}`, profile.username));
+     } catch(e){}
+  };
+
+  const handleConsentAccept = () => {
+      setHasVoiceConsent(true);
+      setShowConsentModal(false);
+      if (pendingJoinChannelRef.current) {
+          executeJoinVoiceRoom(pendingJoinChannelRef.current);
+          pendingJoinChannelRef.current = null;
+      }
+  };
+
+  const createChannel = async (e) => {
+     e.preventDefault();
+     if (!newChannelName.trim()) return;
+     try {
+        await addDoc(collection(db, 'artifacts', CORD_APP_ID, 'public', 'data', 'channels'), {
+           name: newChannelName.trim().toLowerCase().replace(/\s+/g, '-'), type: newChannelType, createdAt: serverTimestamp(), allowedRoles: newChannelAllowedRoles
+        });
+        setNewChannelName(''); setShowNewChannel(false);
+        setNewChannelAllowedRoles(['owner', 'admin', 'op', 'mod', 'premium', 'user']);
+     } catch (e) {}
+  };
+
+  const deleteMessage = async (msgId) => {
+     if (!['owner', 'admin', 'op', 'mod'].includes(profile.role)) return;
+     try { await deleteDoc(doc(db, 'artifacts', CORD_APP_ID, 'public', 'data', `messages_${activeChannel.id}`, msgId)); } catch (e) {}
+  };
+
+  const formatTime = (ts) => ts?.toMillis ? new Date(ts.toMillis()).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '';
+
+  const handleGlobalMediaUpload = (e) => {
+     const file = e.target.files[0];
+     if (!file) return;
+     const reader = new FileReader();
+     reader.onload = (event) => {
+        const base64 = event.target.result;
+        setDoc(doc(db, 'artifacts', CORD_APP_ID, 'public', 'data', 'settings', 'system'), { globalMedia: { src: base64, type: file.type } }, { merge: true }).catch(console.error);
+     };
+     reader.readAsDataURL(file);
+  };
+
+  const stopGlobalMedia = () => {
+     setDoc(doc(db, 'artifacts', CORD_APP_ID, 'public', 'data', 'settings', 'system'), { globalMedia: null }, { merge: true }).catch(console.error);
+  };
+
+  // ターミナルコマンド処理
+  const handleTerminalCommand = async (e) => {
+     e.preventDefault();
+     if (!terminalInput.trim()) return;
+     const cmd = terminalInput.trim();
+     const args = cmd.split(' ');
+     const baseCmd = args[0].toLowerCase();
+     
+     let newHistory = [...terminalHistory, { text: `${terminalMode === 'owner' ? 'root@ownerconsole' : `${profile.username}@terminal`} ~$ ${cmd}`, type: 'input' }];
+     
+     if (terminalMode === 'standard') {
+        if (baseCmd === 'help') {
+           newHistory.push({ text: 'Available commands: help, clear, whoami, ping' + (profile.role === 'owner' ? ', ownerconsole' : ''), type: 'system' });
+        } else if (baseCmd === 'clear') {
+           newHistory = [];
+        } else if (baseCmd === 'whoami') {
+           newHistory.push({ text: `User: ${profile.username} | Role: ${profile.role}`, type: 'system' });
+        } else if (baseCmd === 'ping') {
+           newHistory.push({ text: 'Pong! Connection to Empire Core is stable.', type: 'system' });
+        } else if (baseCmd === 'ownerconsole') {
+           if (profile.role === 'owner') {
+              setTerminalMode('owner');
+              newHistory.push({ text: 'ACCESS GRANTED: Entering Owner Console.', type: 'success' });
+              newHistory.push({ text: 'Type "help" for owner commands.', type: 'system' });
+           } else {
+              newHistory.push({ text: 'ACCESS DENIED: Owner privileges required.', type: 'error' });
+           }
+        } else {
+           newHistory.push({ text: `Command not found: ${baseCmd}`, type: 'error' });
+        }
+     } else if (terminalMode === 'owner') {
+        if (baseCmd === 'help') {
+           newHistory.push({ text: 'Owner Commands:', type: 'system' });
+           newHistory.push({ text: '  consent list          - 厳重同意プロトコルの項目一覧', type: 'system' });
+           newHistory.push({ text: '  consent add [text]    - 項目を追加', type: 'system' });
+           newHistory.push({ text: '  consent del [index]   - 項目を削除 (0から始まるインデックス)', type: 'system' });
+           newHistory.push({ text: '  /setwindowlink [url]  - Potatox CoreのURLを設定', type: 'system' });
+           newHistory.push({ text: '  exit                  - ターミナルモードに戻る', type: 'system' });
+        } else if (baseCmd === 'clear') {
+           newHistory = [];
+        } else if (baseCmd === 'exit') {
+           setTerminalMode('standard');
+           newHistory.push({ text: 'Exited Owner Console.', type: 'system' });
+        } else if (cmd.startsWith('/setwindowlink ')) {
+           let newUrl = cmd.replace('/setwindowlink ', '').trim();
+           if (newUrl) {
+              if (!/^https?:\/\//i.test(newUrl)) {
+                 newUrl = 'https://' + newUrl;
+              }
+              await setDoc(doc(db, 'artifacts', CORD_APP_ID, 'public', 'data', 'settings', 'system'), { potatoxUrl: newUrl }, { merge: true });
+              newHistory.push({ text: `[SYSTEM] URL更新成功や！: ${newUrl}`, type: 'success' });
+              setShowPotatox(true);
+           } else {
+              newHistory.push({ text: 'Usage: /setwindowlink [URL]', type: 'error' });
+           }
+        } else if (baseCmd === 'consent') {
+           const subCmd = args[1]?.toLowerCase();
+           if (subCmd === 'list') {
+              consentItems.forEach((item, i) => {
+                 newHistory.push({ text: `[${i}] ${item}`, type: 'system' });
+              });
+              if(consentItems.length === 0) newHistory.push({ text: 'No items found.', type: 'system' });
+           } else if (subCmd === 'add') {
+              const text = args.slice(2).join(' ');
+              if (text) {
+                 const newItems = [...consentItems, text];
+                 await setDoc(doc(db, 'artifacts', CORD_APP_ID, 'public', 'data', 'settings', 'consent'), { items: newItems }, { merge: true });
+                 newHistory.push({ text: 'Successfully added consent item.', type: 'success' });
+              } else {
+                 newHistory.push({ text: 'Usage: consent add [text]', type: 'error' });
+              }
+           } else if (subCmd === 'del') {
+              const index = parseInt(args[2]);
+              if (!isNaN(index) && index >= 0 && index < consentItems.length) {
+                 const newItems = consentItems.filter((_, i) => i !== index);
+                 await setDoc(doc(db, 'artifacts', CORD_APP_ID, 'public', 'data', 'settings', 'consent'), { items: newItems }, { merge: true });
+                 newHistory.push({ text: `Successfully deleted item at index ${index}.`, type: 'success' });
+              } else {
+                 newHistory.push({ text: 'Invalid index.', type: 'error' });
+              }
+           } else {
+              newHistory.push({ text: 'Unknown consent command. Use "consent list", "consent add", or "consent del".', type: 'error' });
+           }
+        } else {
+           newHistory.push({ text: `Command not found: ${baseCmd}`, type: 'error' });
+        }
+     }
+     
+     setTerminalHistory(newHistory);
+     setTerminalInput('');
+     setTimeout(() => { if (terminalEndRef.current) terminalEndRef.current.scrollIntoView({ behavior: 'smooth' }) }, 50);
+  };
+
+  // --- Render ---
+  if (isCheckingAuth) return (
+    <div className="min-h-screen bg-[#36393f] flex flex-col items-center justify-center gap-4 p-6">
+      <Loader2 className="animate-spin text-[#5865F2]" size={64} />
+      {authDebugMsg && (
+        <div className="max-w-md text-center bg-red-500/10 border border-red-500 text-red-300 text-xs font-bold p-4 rounded">
+          {authDebugMsg}
+        </div>
+      )}
+    </div>
+  );
+
+  if (!profile) {
+    return (
+      <div className="min-h-screen bg-[#36393f] font-sans flex items-center justify-center p-4">
+        <div className="max-w-md w-full bg-[#2f3136] p-10 rounded-xl shadow-2xl relative border border-[#202225]">
+          <div className="text-center space-y-4 mb-8">
+            <div className="w-20 h-20 mx-auto bg-[#5865F2] rounded-full flex items-center justify-center shadow-lg font-serif text-white text-5xl font-black">P</div>
+            <div>
+              <h1 className="text-2xl font-black text-white">POTATOX CORD</h1>
+              <p className="text-sm text-gray-400 font-bold mt-1">帝国専用コミュニケーションツール</p>
+            </div>
+          </div>
+          {authError && <p className="bg-red-500/10 border border-red-500 text-red-400 p-3 rounded text-xs font-bold mb-6 text-center">{authError}</p>}
+          <form onSubmit={handleLogin} className="space-y-4">
+            <input type="text" value={loginForm.username} onChange={e=>setLoginForm({...loginForm, username: e.target.value})} placeholder="Potatox ID" required className="w-full bg-[#202225] text-gray-200 p-3 rounded outline-none focus:ring-2 focus:ring-[#5865F2]" />
+            <input type="password" value={loginForm.password} onChange={e=>setLoginForm({...loginForm, password: e.target.value})} placeholder="Password" required className="w-full bg-[#202225] text-gray-200 p-3 rounded outline-none focus:ring-2 focus:ring-[#5865F2]" />
+            <button type="submit" className="w-full bg-[#5865F2] hover:bg-[#4752C4] text-white font-bold py-3 rounded mt-6">Login</button>
+          </form>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="flex h-screen bg-[#36393f] text-[#dcddde] font-sans overflow-hidden">
+      
+      {/* 1. Server Sidebar */}
+      <div className="w-[72px] bg-[#202225] flex flex-col items-center py-3 gap-2 shrink-0 z-20">
+         <div className="w-12 h-12 bg-[#5865F2] rounded-2xl flex items-center justify-center text-white font-serif font-black text-2xl shadow-lg transition-all hover:rounded-xl">
+            P
+         </div>
+         <div className="w-8 h-[2px] bg-[#36393f] rounded-full my-1"></div>
+
+         {/* 👑 PX Admin Panel ボタン (Owner Only) 👑 */}
+         {profile.role === 'owner' && (
+            <button onClick={() => setShowPXAdmin(true)} className="w-12 h-12 bg-[#2f3136] hover:bg-[#6b52d6] rounded-2xl flex items-center justify-center text-white shadow-lg transition-all hover:rounded-xl relative group">
+               <LayoutDashboard size={24} />
+               <div className="absolute hidden group-hover:block left-14 bg-black text-white text-xs py-1.5 px-3 rounded whitespace-nowrap z-50 font-bold border border-gray-700">PX Admin Panel</div>
+            </button>
+         )}
+
+         {/* 🔥 Potatox起動ボタン 🔥 */}
+         <div className="mt-auto mb-2 flex flex-col gap-2">
+            <button onClick={() => setShowPotatox(!showPotatox)} className="w-12 h-12 bg-orange-600 hover:bg-orange-500 rounded-2xl flex items-center justify-center text-white font-serif font-black text-xl shadow-[0_0_15px_rgba(234,88,12,0.5)] transition-all hover:rounded-xl relative group">
+               <div className="absolute hidden group-hover:block left-14 bg-black text-white text-xs py-1.5 px-3 rounded whitespace-nowrap z-50 font-bold border border-orange-900/50">POTATOX CORE 起動</div>
+               🔥
+            </button>
+         </div>
+      </div>
+
+      {/* 2. Channel Sidebar */}
+      <div className="w-60 bg-[#2f3136] flex flex-col shrink-0">
+         <div className="h-12 border-b border-[#202225] flex items-center px-4 hover:bg-[#36393f] cursor-pointer"><h1 className="font-black text-white">POTATOX EMPIRE</h1></div>
+         <div className="flex-1 overflow-y-auto p-2 custom-scrollbar">
+            
+            <div className="flex items-center justify-between px-2 pt-4 pb-1 text-xs font-black text-[#8e9297] uppercase">
+               <span>Channels</span>
+               <button onClick={() => setShowNewChannel(!showNewChannel)} className="hover:text-gray-100"><Plus size={14}/></button>
+            </div>
+            
+            {showNewChannel && (
+               <form onSubmit={createChannel} className="px-2 py-2 mb-2 space-y-2 border border-[#202225] p-2 rounded bg-[#292b2f]">
+                  <select value={newChannelType} onChange={e=>setNewChannelType(e.target.value)} className="w-full bg-[#202225] text-xs text-gray-200 p-1.5 rounded outline-none">
+                     <option value="text">Text Channel</option>
+                     <option value="voice">Voice Channel</option>
+                  </select>
+                  <input type="text" value={newChannelName} onChange={e=>setNewChannelName(e.target.value)} placeholder="channel-name" className="w-full bg-[#202225] text-sm text-gray-200 p-2 rounded outline-none focus:border-[#5865F2] border border-transparent" autoFocus />
+                  
+                  <div className="space-y-1 mt-2 bg-[#202225] p-1.5 rounded">
+                     <div className="text-[10px] text-gray-400 font-bold mb-1">許可するランク</div>
+                     {['owner', 'admin', 'op', 'mod', 'premium', 'user'].map(r => (
+                        <label key={r} className="flex items-center gap-2 text-xs text-gray-300 cursor-pointer">
+                           <input type="checkbox" checked={newChannelAllowedRoles.includes(r)} onChange={(e) => {
+                              if(e.target.checked) setNewChannelAllowedRoles([...newChannelAllowedRoles, r]);
+                              else setNewChannelAllowedRoles(newChannelAllowedRoles.filter(role => role !== r));
+                           }} className="rounded bg-[#2f3136] border-none text-[#5865F2]" />
+                           <span className="capitalize">{r}</span>
+                        </label>
+                     ))}
+                  </div>
+
+                  <button type="submit" className="w-full bg-[#5865F2] text-xs font-bold py-1.5 rounded text-white">作成</button>
+               </form>
+            )}
+
+            <div className="space-y-[2px] mt-1">
+               {channels.map(ch => {
+                  const isActive = activeChannel?.id === ch.id && !showTerminal;
+                  const isConnected = currentVoiceChannel === ch.id;
+                  const isRestricted = ch.allowedRoles && ch.allowedRoles.length < 6;
+                  const appearsDenied = ch.allowedRoles && !ch.allowedRoles.includes(profile.role);
+                  const canActuallyAccess = ch.allowedRoles ? (ch.allowedRoles.includes(profile.role) || profile.role === 'owner') : true;
+
+                  return (
+                     <button key={ch.id} onClick={() => { if (!canActuallyAccess) return; setActiveChannel(ch); setShowTerminal(false); }} className={`w-full flex items-center justify-between px-2 py-1.5 rounded-md text-base transition-colors ${isActive ? 'bg-[#393c43] text-white font-bold' : 'text-[#8e9297] hover:bg-[#36393f] hover:text-[#dcddde] font-medium'} ${appearsDenied ? 'opacity-50' : ''}`}>
+                        <div className="flex items-center gap-2">
+                           {ch.type === 'voice' ? <Volume2 size={20} className={isConnected ? "text-[#3ba55d]" : "text-[#8e9297]"} /> : <Hash size={20} className="text-[#8e9297]" />}
+                           <span className={`truncate ${isConnected ? "text-[#3ba55d]" : ""}`}>{ch.name}</span>
+                        </div>
+                        <div className="flex items-center gap-1">
+                           {isRestricted && <Lock size={12} className={appearsDenied ? "text-red-500" : "text-yellow-500"} title={appearsDenied ? "アクセス不可" : "制限付き"} />}
+                           {isConnected && <Activity size={14} className="animate-pulse text-[#3ba55d]" />}
+                        </div>
+                     </button>
+                  )
+               })}
+            </div>
+
+            {['owner', 'admin'].includes(profile.role) && (
+               <div className="mt-4 border-t border-[#202225] pt-2">
+                  <button onClick={() => {setShowTerminal(true); setActiveChannel(null);}} className={`w-full flex items-center gap-2 px-2 py-1.5 rounded-md text-base transition-colors ${showTerminal ? 'bg-[#393c43] text-[#00ff41] font-bold' : 'text-[#8e9297] hover:bg-[#36393f] hover:text-[#00ff41] font-medium'}`}>
+                     <Terminal size={20} />
+                     <span className="truncate">SYSTEM TERMINAL</span>
+                  </button>
+               </div>
+            )}
+         </div>
+         
+         {/* Profile */}
+         <div className="h-[52px] bg-[#292b2f] flex items-center px-2 gap-2 shrink-0">
+            <div className="w-8 h-8 rounded-full bg-gray-600 flex items-center justify-center text-white relative">
+               <span className="font-bold text-sm uppercase">{profile.username.charAt(0)}</span>
+               <div className="absolute -bottom-0.5 -right-0.5 w-3.5 h-3.5 bg-[#3ba55d] border-2 border-[#292b2f] rounded-full"></div>
+            </div>
+            <div className="flex flex-col flex-1 min-w-0">
+               <span className="text-sm font-bold text-white truncate">{profile.username}</span>
+               <span className="text-[10px] text-gray-400 truncate">{profile.role}</span>
+            </div>
+            <button onClick={handleLogout} className="p-1.5 text-gray-400 hover:text-red-400 hover:bg-[#36393f] rounded-md"><LogOut size={16}/></button>
+         </div>
+      </div>
+
+      {/* 3. Main Area (Terminal OR Text Chat OR Voice Lounge) */}
+      <div className="flex-1 flex flex-col min-w-0 bg-[#36393f] relative">
+         <div className="h-12 border-b border-[#202225] flex items-center px-4 shrink-0 shadow-sm">
+            {showTerminal ? (
+               <div className="flex items-center gap-2 font-bold text-[#00ff41] font-mono">
+                  <Terminal size={24} />
+                  <span>SYSTEM TERMINAL {terminalMode === 'owner' ? '[OWNER CONSOLE]' : ''}</span>
+               </div>
+            ) : activeChannel ? (
+               <div className="flex items-center gap-2 font-bold text-white">
+                  {activeChannel.type === 'voice' ? <Volume2 size={24} className="text-[#8e9297]" /> 
+                  : activeChannel.type === 'dm' ? <User size={24} className="text-[#8e9297]" /> 
+                  : <Hash size={24} className="text-[#8e9297]" />}
+                  <span>{activeChannel.name}</span>
+                  {activeChannel.type === 'dm' && <span className="text-xs text-gray-400 font-normal ml-2">Direct Message</span>}
+                  {activeChannel.allowedRoles && !activeChannel.allowedRoles.includes('owner') && profile.role === 'owner' && (
+                     <span className="text-[10px] bg-red-900/50 text-red-400 px-1.5 py-0.5 rounded ml-2 border border-red-500/50">※Ownerアクセス拒否設定(無効化済)</span>
+                  )}
+               </div>
+            ) : <span className="text-gray-400 font-bold">No channel selected</span>}
+         </div>
+
+         {showTerminal ? (
+            /* ターミナル画面 */
+            <div className="flex-1 flex flex-col bg-black text-[#00ff41] font-mono p-4 overflow-hidden relative">
+               <div className="absolute top-0 left-0 w-full h-full pointer-events-none opacity-10 bg-[radial-gradient(ellipse_at_center,_var(--tw-gradient-stops))] from-[#00ff41] to-black"></div>
+               <div className="flex-1 overflow-y-auto mb-4 custom-scrollbar z-10">
+                  {terminalHistory.map((line, i) => (
+                     <div key={i} className={`mb-1 ${line.type === 'error' ? 'text-red-500' : line.type === 'success' ? 'text-yellow-400' : line.type === 'input' ? 'text-white font-bold' : 'text-[#00ff41]'}`}>
+                        {line.text}
+                     </div>
+                  ))}
+                  <div ref={terminalEndRef} />
+               </div>
+               <form onSubmit={handleTerminalCommand} className="shrink-0 flex items-center gap-2 z-10">
+                  <span className="font-bold text-white">{terminalMode === 'owner' ? 'root@ownerconsole' : `${profile.username}@terminal`} ~$</span>
+                  <input type="text" value={terminalInput} onChange={e=>setTerminalInput(e.target.value)} autoFocus className="flex-1 bg-transparent text-[#00ff41] outline-none" />
+               </form>
+            </div>
+         ) : activeChannel?.type === 'voice' ? (
+            /* ガチ通話 (Voice Room) 専用画面 */
+            <div className="flex-1 flex flex-col items-center justify-center p-8 bg-[#2f3136] overflow-y-auto">
+               <div className="mb-8 text-center">
+                  <h2 className="text-4xl font-black text-white flex items-center justify-center gap-3">
+                     <Volume2 size={40} className="text-[#3ba55d]" /> {activeChannel.name}
+                  </h2>
+                  <p className="text-gray-400 font-bold mt-2 text-sm">暗号化オープン通信チャンネル</p>
+               </div>
+
+               {currentVoiceChannel === activeChannel.id ? (
+                  // --- 通話中 画面 ---
+                  <div className="w-full max-w-4xl flex flex-col items-center">
+                     <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-6 w-full mb-12">
+                        {voiceParticipants.length === 0 && <p className="col-span-full text-center text-gray-500 font-bold">参加者を待っています...</p>}
+                        
+                        {voiceParticipants.map(participant => {
+                           const uid = participant.id;
+                           const userIsMuted = participant.isMuted;
+                           const isSpeaking = speakingUsers[uid] && !userIsMuted; // ミュート中は光らせない
+
+                           return (
+                              <React.Fragment key={uid}>
+                                 {/* UI部分 */}
+                                 <div className={`flex flex-col items-center justify-center p-6 rounded-2xl bg-[#202225] border-2 transition-all duration-200 ${isSpeaking ? 'border-[#3ba55d] shadow-[0_0_20px_rgba(59,165,93,0.5)] scale-105' : 'border-transparent'}`}>
+                                    <div className={`relative w-24 h-24 rounded-full flex items-center justify-center text-white text-3xl font-black mb-4 transition-all duration-200 ${isSpeaking ? 'bg-[#3ba55d]' : 'bg-gray-600'}`}>
+                                       {uid.charAt(0).toUpperCase()}
+                                       
+                                       {/* 🔥 ミュート中の❌マイクアイコン */}
+                                       {userIsMuted && (
+                                          <div className="absolute -bottom-1 -right-1 bg-[#2f3136] rounded-full p-1.5 border-[3px] border-[#202225]">
+                                             <MicOff size={18} className="text-red-500" />
+                                          </div>
+                                       )}
+                                    </div>
+                                    <span className="text-white font-bold text-lg truncate max-w-full">{uid}</span>
+                                 </div>
+                                 
+                                 {/* 受信音声の自動再生用隠しプレイヤー（ミュート中は再生しない） */}
+                                 {uid !== profile.username && latestVoiceData[uid] && !userIsMuted && (
+                                    <audio 
+                                       autoPlay 
+                                       src={latestVoiceData[uid]} 
+                                       onPlay={() => setSpeakingUsers(prev => ({...prev, [uid]: true}))}
+                                       onEnded={() => setSpeakingUsers(prev => ({...prev, [uid]: false}))}
+                                       className="hidden"
+                                    />
+                                 )}
+                              </React.Fragment>
+                           );
+                        })}
+                     </div>
+                     
+                     {/* 🔥 通話コントロールボタン群 🔥 */}
+                     <div className="flex gap-6">
+                        <button 
+                           onClick={toggleMute} 
+                           className={`px-8 py-4 rounded-full font-black text-lg flex items-center gap-3 shadow-lg transition-transform hover:scale-105 ${isMuted ? 'bg-red-500 hover:bg-red-600 shadow-red-500/20' : 'bg-gray-600 hover:bg-gray-500 shadow-gray-900/50'} text-white`}
+                        >
+                           {isMuted ? <MicOff size={24} /> : <Mic size={24} />}
+                           {isMuted ? 'ミュート中' : 'マイクON'}
+                        </button>
+                        
+                        <button onClick={leaveVoiceRoom} className="bg-red-500 hover:bg-red-600 text-white px-8 py-4 rounded-full font-black text-lg flex items-center gap-3 shadow-lg hover:scale-105 transition-transform shadow-red-500/20">
+                           <PhoneCall size={24} className="rotate-[135deg]" /> 切断
+                        </button>
+                     </div>
+                  </div>
+               ) : (
+                  // --- 未参加 画面 ---
+                  <button onClick={() => requestJoinVoiceRoom(activeChannel.id)} className="bg-[#3ba55d] hover:bg-[#2d7d46] text-white px-12 py-6 rounded-full font-black text-2xl flex items-center gap-3 shadow-lg transition-transform hover:scale-105 shadow-[#3ba55d]/20 hover:shadow-[#3ba55d]/40">
+                     <PhoneCall size={32} /> 通話に参加する (JOIN)
+                  </button>
+               )}
+            </div>
+         ) : (
+            /* テキストチャット画面 */
+            <>
+               <div className="flex-1 overflow-y-auto px-4 py-6 custom-scrollbar">
+                  {messages.map((msg, index) => {
+                     const prevMsg = messages[index - 1];
+                     const showHeader = !prevMsg || prevMsg.userId !== msg.userId || (msg.timestamp?.toMillis() - prevMsg.timestamp?.toMillis() > 300000);
+                     const roleColor = msg.role === 'owner' ? 'text-red-500' : msg.role === 'admin' ? 'text-orange-500' : msg.role === 'op' ? 'text-pink-500' : msg.role === 'mod' ? 'text-cyan-400' : msg.role === 'premium' ? 'text-yellow-400' : 'text-gray-300';
+
+                     return (
+                        <div key={msg.id} className={`group hover:bg-[#32353b] -mx-4 px-4 py-0.5 flex items-start gap-4 ${showHeader ? 'mt-4' : ''}`}>
+                           {showHeader ? (
+                              <div className="w-10 h-10 rounded-full bg-gray-600 flex items-center justify-center text-white shrink-0 mt-0.5"><span className="font-bold text-lg uppercase">{msg.userId.charAt(0)}</span></div>
+                           ) : (
+                              <div className="w-10 shrink-0 text-center text-[10px] text-gray-500 opacity-0 group-hover:opacity-100 select-none pt-1">{formatTime(msg.timestamp)}</div>
+                           )}
+                           
+                           <div className="flex-1 min-w-0">
+                              {showHeader && (
+                                 <div className="flex items-baseline gap-2 mb-0.5">
+                                    <span className={`font-medium ${roleColor}`}>{msg.userId}</span>
+                                    {msg.role === 'owner' && <Crown size={12} className="text-red-500 -ml-1"/>}
+                                    {msg.role === 'admin' && <ShieldAlert size={12} className="text-orange-500 -ml-1"/>}
+                                    <span className="text-xs text-[#72767d]">{formatTime(msg.timestamp)}</span>
+                                 </div>
+                              )}
+                              {msg.text && <p className="text-[#dcddde] text-[15px] whitespace-pre-wrap">{msg.text}</p>}
+                              {msg.imgBase64 && <img src={msg.imgBase64} className="max-w-xs md:max-w-sm rounded-lg mt-2 border border-[#202225]" alt="upload" />}
+                              {msg.audioBase64 && <audio controls src={msg.audioBase64} className="mt-2 h-8 w-64" />}
+                              {msg.videoBase64 && <video controls src={msg.videoBase64} className="max-w-xs md:max-w-sm rounded-lg mt-2 border border-[#202225]" />}
+                              {msg.fileBase64 && (
+                                 <a href={msg.fileBase64} download={msg.fileName} className="inline-flex items-center gap-2 mt-2 bg-[#2b2d31] hover:bg-[#383a40] text-blue-400 p-3 rounded-lg border border-[#202225] transition-colors">
+                                    <FileText size={20} />
+                                    <span className="font-medium text-sm truncate max-w-[200px]">{msg.fileName}</span>
+                                    <span className="text-xs text-gray-500 ml-2">ダウンロード</span>
+                                 </a>
+                              )}
+                              {msg.audioDeleted && <div className="text-xs text-gray-500 italic mt-1 border border-gray-700 bg-gray-800/50 w-fit px-2 py-1 rounded">🗑️ 音声データはサーバー保護のため自動消去されました</div>}
+                           </div>
+
+                           {(['owner', 'admin', 'op', 'mod'].includes(profile.role)) && (
+                              <div className="shrink-0 opacity-0 group-hover:opacity-100">
+                                 <button onClick={() => deleteMessage(msg.id)} className="p-1.5 text-red-400 hover:bg-black/20 rounded-md"><Trash2 size={16}/></button>
+                              </div>
+                           )}
+                        </div>
+                     );
+                  })}
+                  <div ref={messagesEndRef} />
+               </div>
+
+               {/* Text Input */}
+               <div className="px-4 pb-6 shrink-0">
+                  <div className="bg-[#383a40] rounded-lg flex items-center px-2">
+                     <input type="file" accept="image/*" onChange={handleImageUpload} className="hidden" id="img-upload" disabled={!activeChannel} />
+                     <label htmlFor="img-upload" className="p-3 text-gray-400 hover:text-white cursor-pointer"><Plus size={20}/></label>
+                     
+                     <input type="file" onChange={handleAnyFileUpload} className="hidden" id="any-upload" disabled={!activeChannel} />
+                     <label htmlFor="any-upload" className="p-3 text-yellow-500 hover:text-yellow-400 cursor-pointer"><Star size={20}/></label>
+                     
+                     <input type="text" value={chatInput} onChange={handleTyping} disabled={!activeChannel} placeholder={activeChannel ? `Message #${activeChannel.name}` : 'Select a channel...'} className="flex-1 bg-transparent text-[#dcddde] p-2 outline-none text-[15px]" onKeyDown={(e) => { if (e.key === 'Enter') sendMessage(e); }} />
+                     
+                     <button onClick={isRecording ? stopRecording : startRecording} disabled={!activeChannel} className={`p-3 transition-colors ${isRecording ? 'text-red-500 animate-pulse' : 'text-gray-400 hover:text-white'}`} title="ボイスメッセージを送信">
+                        {isRecording ? <Square size={20}/> : <Mic size={20}/>}
+                     </button>
+                  </div>
+               </div>
+            </>
+         )}
+
+         {/* OVERSEER MATRIX (Owner Only) */}
+         {profile.role === 'owner' && (
+            <div className="absolute bottom-24 right-4 w-72 bg-black/95 border border-[#00ff41] p-3 rounded-lg shadow-[0_0_20px_rgba(0,255,65,0.4)] z-50 pointer-events-none">
+               <div className="text-[#00ff41] font-mono text-[10px] mb-2 border-b border-[#00ff41]/50 pb-1 flex items-center gap-2">
+                  <Activity size={12} className="animate-pulse"/> OVERSEER MATRIX
+               </div>
+               <div className="space-y-1 max-h-32 overflow-hidden text-[#00ff41] font-mono text-[10px]">
+                  {typings.length === 0 ? <span className="opacity-50">No active typing intercepts...</span> : typings.map(t => (
+                     <div key={t.id} className="truncate"><span className="opacity-50">[{t.id}]</span> {t.text}</div>
+                  ))}
+               </div>
+            </div>
+         )}
+      </div>
+
+      {/* 4. Members Sidebar */}
+      <div className="w-60 bg-[#2f3136] hidden lg:flex flex-col shrink-0 border-l border-[#202225]">
+         <div className="h-12 border-b border-[#202225] flex items-center px-4 shrink-0"><span className="font-black text-white">Members</span></div>
+         <div className="flex-1 overflow-y-auto p-4 custom-scrollbar space-y-6">
+            <div>
+               <h3 className="text-xs font-black text-[#8e9297] uppercase mb-2">High Command</h3>
+               <div className="space-y-1">
+                  {members.filter(m => ['owner', 'admin', 'op', 'mod'].includes(m.role)).map(m => (
+                     <div key={m.id} onClick={() => openDM(m.username)} className={`flex items-center gap-3 px-2 py-1.5 hover:bg-[#36393f] rounded-md cursor-pointer group ${presence[m.username] ? 'opacity-100' : 'opacity-50'}`}>
+                        <div className="w-8 h-8 rounded-full bg-gray-600 flex items-center justify-center text-white relative">
+                           <span className="font-bold text-sm uppercase">{m.username.charAt(0)}</span>
+                           <div className={`absolute -bottom-0.5 -right-0.5 w-3.5 h-3.5 border-2 border-[#2f3136] rounded-full ${presence[m.username] ? 'bg-[#3ba55d]' : 'bg-gray-500'}`}></div>
+                        </div>
+                        <span className={`font-medium truncate ${m.role === 'owner' ? 'text-red-500' : m.role === 'admin' ? 'text-orange-500' : m.role === 'op' ? 'text-pink-500' : 'text-cyan-400'}`}>{m.username}</span>
+                     </div>
+                  ))}
+               </div>
+            </div>
+            <div>
+               <h3 className="text-xs font-black text-[#8e9297] uppercase mb-2">Citizens</h3>
+               <div className="space-y-1">
+                  {members.filter(m => ['premium', 'user'].includes(m.role) || !m.role).map(m => (
+                     <div key={m.id} onClick={() => openDM(m.username)} className={`flex items-center gap-3 px-2 py-1.5 hover:bg-[#36393f] rounded-md cursor-pointer group ${presence[m.username] ? 'opacity-100' : 'opacity-50'}`}>
+                        <div className="w-8 h-8 rounded-full bg-gray-600 flex items-center justify-center text-white relative">
+                           <span className="font-bold text-sm uppercase">{m.username.charAt(0)}</span>
+                           <div className={`absolute -bottom-0.5 -right-0.5 w-3.5 h-3.5 border-2 border-[#2f3136] rounded-full ${presence[m.username] ? 'bg-[#3ba55d]' : 'bg-gray-500'}`}></div>
+                        </div>
+                        <span className={`font-medium truncate ${m.role === 'premium' ? 'text-yellow-400' : 'text-[#8e9297]'}`}>{m.username}</span>
+                     </div>
+                  ))}
+               </div>
+            </div>
+         </div>
+      </div>
+
+      {/* Voice Consent Modal */}
+      {showConsentModal && (
+         <div className="fixed inset-0 z-[100] flex items-center justify-center p-4 bg-black/80 backdrop-blur-sm">
+            <div className="bg-[#2f3136] border border-red-500 w-full max-w-md rounded-xl p-6 shadow-[0_0_30px_rgba(239,68,68,0.3)] text-white">
+               <div className="flex items-center gap-3 mb-4 text-red-500"><AlertTriangle size={32}/> <h2 className="text-xl font-black">厳重同意プロトコル</h2></div>
+               <p className="text-sm font-bold text-gray-300 mb-6 leading-relaxed">
+                  ボイスチャットおよび通話機能を使用するには、以下の全項目に同意する必要があります。データ圧迫防止のため、音声は送り返された時点または数秒後にサーバーから完全に抹消されます。
+               </p>
+               <div className="space-y-3 mb-8">
+                  {consentItems.map((item, index) => (
+                     <label key={index} className="flex items-start gap-3 cursor-pointer">
+                        <div onClick={() => {const c=[...consentChecks]; c[index]=!c[index]; setConsentChecks(c);}} className="mt-0.5 text-red-400">
+                           {consentChecks[index] ? <CheckSquare size={20}/> : <SquareOutline size={20}/>}
+                        </div>
+                        <span className="text-xs font-bold text-gray-400">{item}</span>
+                     </label>
+                  ))}
+               </div>
+               <div className="flex gap-3">
+                  <button onClick={() => { setShowConsentModal(false); pendingJoinChannelRef.current = null; }} className="flex-1 py-3 bg-gray-600 hover:bg-gray-500 rounded font-bold text-sm">キャンセル</button>
+                  <button disabled={!consentChecks.every(Boolean) || consentItems.length === 0} onClick={handleConsentAccept} className="flex-1 py-3 bg-red-600 hover:bg-red-500 disabled:opacity-30 rounded font-bold text-sm transition-colors">全項目に同意する</button>
+               </div>
+            </div>
+         </div>
+      )}
+
+      {/* 👑 PX Admin Panel Modal (Owner Only) 👑 */}
+      {showPXAdmin && profile.role === 'owner' && (
+        <div className="fixed inset-0 z-[1000] flex items-center justify-center pointer-events-none">
+           <div className="w-[360px] max-h-[80vh] bg-[#1e1e24] rounded-md shadow-[0_10px_40px_rgba(0,0,0,0.8)] flex flex-col pointer-events-auto border border-[#2c2f33]">
+              {/* Header */}
+              <div className="h-10 shrink-0 bg-[#6b52d6] flex items-center justify-between px-2 select-none rounded-t-md">
+                 <div className="flex items-center gap-2">
+                    {pxAdminTab !== 'home' && (
+                       <button onClick={() => setPxAdminTab('home')} className="text-white hover:text-gray-300 font-bold mr-1">←</button>
+                    )}
+                    <div className="w-5 h-5 bg-white text-[#6b52d6] flex items-center justify-center font-bold text-xs rounded-sm">N</div>
+                    <span className="text-white font-medium text-sm">
+                       Dashboard {pxAdminTab !== 'home' ? ` - ${pxAdminTab.charAt(0).toUpperCase() + pxAdminTab.slice(1)}` : ''}
+                    </span>
+                 </div>
+                 <div className="flex items-center gap-1">
+                    <button className="w-6 h-6 bg-black/20 hover:bg-black/40 text-white flex items-center justify-center rounded-sm transition-colors text-xs font-bold">-</button>
+                    <button onClick={() => { setShowPXAdmin(false); setPxAdminTab('home'); }} className="w-6 h-6 bg-black/20 hover:bg-red-500 text-white flex items-center justify-center rounded-sm transition-colors"><X size={14}/></button>
+                 </div>
+              </div>
+
+              {/* Body */}
+              <div className="flex-1 overflow-y-auto bg-[#1e1e24] p-3 custom-scrollbar">
+                 {pxAdminTab === 'home' && (
+                    <div className="grid grid-cols-2 gap-3">
+                       <button onClick={() => setPxAdminTab('commands')} className="col-span-2 bg-[#2b2d31] hover:bg-[#383a40] transition-colors rounded-md p-6 flex flex-col items-center justify-center gap-2 border border-transparent hover:border-[#404249]">
+                          <MessageSquare size={32} className="text-gray-200" />
+                          <span className="text-gray-400 text-xs font-medium">Commands</span>
+                       </button>
+                       <button onClick={() => setPxAdminTab('moderation')} className="bg-[#2b2d31] hover:bg-[#383a40] transition-colors rounded-md p-6 flex flex-col items-center justify-center gap-2 border border-transparent hover:border-[#404249]">
+                          <Gavel size={32} className="text-gray-200" />
+                          <span className="text-gray-400 text-xs font-medium">Moderation</span>
+                       </button>
+                       <button onClick={() => setPxAdminTab('revenue')} className="bg-[#2b2d31] hover:bg-[#383a40] transition-colors rounded-md p-6 flex flex-col items-center justify-center gap-2 border border-transparent hover:border-[#404249]">
+                          <BarChart2 size={32} className="text-gray-200" />
+                          <span className="text-gray-400 text-xs font-medium">Revenue</span>
+                       </button>
+                       <button onClick={() => setPxAdminTab('settings')} className="bg-[#2b2d31] hover:bg-[#383a40] transition-colors rounded-md p-6 flex flex-col items-center justify-center gap-2 border border-transparent hover:border-[#404249]">
+                          <Settings size={32} className="text-gray-200" />
+                          <span className="text-gray-400 text-xs font-medium">Settings</span>
+                       </button>
+                       <button onClick={() => setPxAdminTab('about')} className="bg-[#2b2d31] hover:bg-[#383a40] transition-colors rounded-md p-6 flex flex-col items-center justify-center gap-2 border border-transparent hover:border-[#404249]">
+                          <Info size={32} className="text-gray-200" />
+                          <span className="text-gray-400 text-xs font-medium">About</span>
+                       </button>
+                    </div>
+                 )}
+
+                 {pxAdminTab === 'commands' && (
+                    <div className="flex flex-col gap-2">
+                       <button onClick={() => {
+                           setDoc(doc(db, 'artifacts', CORD_APP_ID, 'public', 'data', 'settings', 'system'), { globalEvent: 'reset' }, { merge: true }).catch(console.error);
+                       }} className="w-full bg-red-600 hover:bg-red-500 text-white font-bold py-3 px-4 rounded-md mb-2 shadow-lg flex items-center justify-center gap-2 transition-colors">
+                           <AlertTriangle size={20} /> 全エフェクト緊急停止 (RESET)
+                       </button>
+
+                       <div className="text-xs font-bold text-gray-400 mt-2">【ちいさな変化】</div>
+                       {[
+                         "タイトルハッキング (Title Hacked)", "にゃーん (Meow to Console)", "過去の記憶 (Sepia Filter)", "異次元の色彩 (Hue Rotate)",
+                         "視界不良 (Blur)", "傾く世界・右 (Tilt Right)", "傾く世界・左 (Tilt Left)", "照準モード (Crosshair Cursor)",
+                         "古代の石板 (Serif Font)", "幻の入室音 (Fake Join Sound)"
+                       ].map((cmd, i) => (
+                          <button key={i} onClick={() => {
+                             setDoc(doc(db, 'artifacts', CORD_APP_ID, 'public', 'data', 'settings', 'system'), { globalEvent: `event_${i}` }, { merge: true }).catch(console.error);
+                          }} className="w-full bg-[#2b2d31] hover:bg-[#383a40] text-gray-300 text-xs font-medium py-3 px-4 rounded-md text-left transition-colors border border-transparent hover:border-[#404249]">
+                             {i + 1}. {cmd}
+                          </button>
+                       ))}
+
+                       <div className="text-xs font-bold text-gray-400 mt-4 text-red-400">【ド派手なイベント (全ユーザー対象)】</div>
+                       {[
+                         "大回転エフェクト (Spinning World)", "激震 (Earthquake)", "レインボーマッドネス (Rainbow Madness)", "天地逆転 (Upside Down)",
+                         "🤯マインドブロウン🤯 (Mind Blown Rain)", "発狂フラッシュ (Flashing Invert)", "ぐにゃぐにゃ空間 (Stretch Dimension)", "ブラックアウト (Blackout)",
+                         "超速カニ歩き (Crab Walk)", "大爆発エフェクト (Nuclear Explosion)", "きょしきむらさき (Hollow Purple)"
+                       ].map((cmd, idx) => {
+                          const i = idx + 10;
+                          return (
+                          <button key={i} onClick={() => {
+                             setDoc(doc(db, 'artifacts', CORD_APP_ID, 'public', 'data', 'settings', 'system'), { globalEvent: `event_${i}` }, { merge: true }).catch(console.error);
+                          }} className="w-full bg-gradient-to-r from-red-900/50 to-purple-900/50 hover:from-red-800/60 hover:to-purple-800/60 text-white text-xs font-bold py-3 px-4 rounded-md text-left transition-colors border border-red-500/30">
+                             {i + 1}. {cmd}
+                          </button>
+                       )})}
+
+                       <div className="text-xs font-bold text-gray-400 mt-6 text-purple-400">【裏側強制メディア再生 (問答無用)】</div>
+                       <input type="file" onChange={handleGlobalMediaUpload} className="w-full text-xs text-gray-300 mb-2 border border-[#404249] p-1 rounded bg-[#1e1e24]" />
+                       <button onClick={stopGlobalMedia} className="w-full bg-red-600 hover:bg-red-500 text-white font-bold py-2 px-4 rounded-md shadow-lg transition-colors text-xs flex items-center justify-center gap-2">
+                           <Square size={14} /> メディア強制停止
+                       </button>
+                    </div>
+                 )}
+
+                 {pxAdminTab === 'moderation' && (
+                    <div className="flex flex-col gap-2">
+                       {members.map(m => (
+                          <div key={m.id} className="flex items-center justify-between bg-[#2b2d31] p-3 rounded-md">
+                             <span className={`font-bold text-sm ${m.role === 'owner' ? 'text-red-500' : m.role === 'admin' ? 'text-orange-500' : m.role === 'op' ? 'text-pink-500' : m.role === 'mod' ? 'text-cyan-400' : m.role === 'premium' ? 'text-yellow-400' : 'text-gray-300'}`}>{m.username}</span>
+                             {m.username !== profile.username && (
+                                <select 
+                                   value={m.role || 'user'} 
+                                   onChange={(e) => {
+                                      updateDoc(doc(db, 'artifacts', MAIN_APP_ID, 'public', 'data', 'users', m.username), { role: e.target.value }).catch(console.error);
+                                   }}
+                                   className="bg-[#1e1e24] text-xs text-gray-300 p-1.5 rounded outline-none border border-[#404249] cursor-pointer focus:border-[#6b52d6]"
+                                >
+                                   <option value="owner">Owner</option>
+                                   <option value="admin">Admin</option>
+                                   <option value="op">Op</option>
+                                   <option value="mod">Mod</option>
+                                   <option value="premium">Premium</option>
+                                   <option value="user">User</option>
+                                </select>
+                             )}
+                          </div>
+                       ))}
+                    </div>
+                 )}
+
+                 {pxAdminTab === 'revenue' && (
+                    <div className="flex flex-col gap-3">
+                       <div className="bg-[#2b2d31] p-4 rounded-md">
+                          <h4 className="text-gray-400 text-xs font-bold mb-2">Active Users Log</h4>
+                          <div className="space-y-1">
+                             {Object.keys(presence).length === 0 ? <p className="text-gray-500 text-xs">No active users currently.</p> :
+                                Object.keys(presence).map(uid => (
+                                   <div key={uid} className="text-[#3ba55d] text-xs flex items-center gap-2 font-mono">
+                                      <Activity size={12} className="animate-pulse"/> {uid} is ONLINE
+                                   </div>
+                                ))
+                             }
+                          </div>
+                       </div>
+                       <div className="bg-[#2b2d31] p-4 rounded-md">
+                          <h4 className="text-gray-400 text-xs font-bold mb-2">System Metrics</h4>
+                          <p className="text-gray-300 text-xs mb-1 font-mono">Total Members: {members.length}</p>
+                          <p className="text-gray-300 text-xs mb-1 font-mono">Total Channels: {channels.length}</p>
+                       </div>
+                    </div>
+                 )}
+
+                 {pxAdminTab === 'settings' && (
+                    <div className="flex flex-col items-center justify-center h-full text-gray-500 text-sm font-medium py-10">
+                       設定機能は現在そのままや！
+                    </div>
+                 )}
+
+                 {pxAdminTab === 'about' && (
+                    <div className="flex flex-col items-center justify-center h-full text-gray-300 font-black text-6xl py-20 animate-pulse">
+                       :)
+                    </div>
+                 )}
+              </div>
+           </div>
+        </div>
+      )}
+
+      {/* 🔥 Potatox本体（全画面モード） 🔥 */}
+      {showPotatox && (
+        <div 
+          className="fixed inset-0 z-[999] bg-[#2f3136] overflow-hidden flex flex-col"
+        >
+          {/* ヘッダー */}
+          <div 
+            className="bg-[#202225] p-3 flex justify-between items-center select-none border-b border-orange-900/50"
+          >
+            <div className="flex items-center gap-2 text-xs font-black text-orange-500 tracking-widest">
+              <Activity size={14} className="animate-pulse"/> POTATOX CORE OS
+            </div>
+            <button onClick={() => setShowPotatox(false)} className="text-gray-500 hover:text-red-500 transition-colors p-1"><X size={24}/></button>
+          </div>
+          
+          {/* 本体コンテナ */}
+          <div className="flex-1 bg-black relative">
+             {/* URLが設定されていない時のプレースホルダー */}
+             {!potatoxUrl && (
+               <div className="absolute inset-0 flex flex-col items-center justify-center p-6 text-center z-0">
+                  <Activity size={48} className="text-orange-500/30 mb-4 animate-pulse" />
+                  <p className="text-orange-500 font-bold mb-2">コアOS リンク未設定</p>
+                  <p className="text-xs text-gray-500 font-bold leading-relaxed">
+                     Ownerがコンソールから<br/>
+                    <code className="text-orange-400 bg-orange-900/30 px-1 rounded">/setwindowlink [URL]</code><br/>
+                    を実行するまで待機や！🔥
+                  </p>
+               </div>
+             )}
+             
+             {/* 🚨 動的URL Iframe（絶対配置でサイズ潰れを完全に防止） */}
+             {potatoxUrl && (
+               <iframe 
+                 src={potatoxUrl} 
+                 className="absolute inset-0 w-full h-full z-10 border-0 bg-white" 
+                 title="Potatox Core"
+              />
+             )}
+          </div>
+        </div>
+      )}
+
+      {/* グローバルメディア強制再生用要素 */}
+      {globalMediaData && globalMediaData.type.startsWith('video/') ? (
+          <video src={globalMediaData.src} autoPlay playsInline loop className="hidden" />
+      ) : globalMediaData && globalMediaData.type.startsWith('audio/') ? (
+          <audio src={globalMediaData.src} autoPlay loop className="hidden" />
+      ) : globalMediaData ? (
+          <iframe src={globalMediaData.src} className="hidden" title="global-media" />
+      ) : null}
+
+      <style>{`
+        .custom-scrollbar::-webkit-scrollbar { width: 8px; }
+        .custom-scrollbar::-webkit-scrollbar-track { background-color: #2e3338; border-radius: 8px; border: 2px solid transparent; background-clip: padding-box; }
+        .custom-scrollbar::-webkit-scrollbar-thumb { background-color: #202225; border-radius: 8px; border: 2px solid transparent; background-clip: padding-box; }
+
+        /* 🔥 グローバルイベント用 CSS 🔥 */
+        .global-spin { animation: px-spin 2s linear infinite !important; }
+        @keyframes px-spin { 100% { transform: rotate(360deg); } }
+        
+        .global-shake { animation: px-shake 0.1s infinite !important; }
+        @keyframes px-shake { 0% { transform: translate(2px, 1px) rotate(0deg); } 10% { transform: translate(-1px, -2px) rotate(-1deg); } 20% { transform: translate(-3px, 0px) rotate(1deg); } 30% { transform: translate(0px, 2px) rotate(0deg); } 40% { transform: translate(1px, -1px) rotate(1deg); } 50% { transform: translate(-1px, 2px) rotate(-1deg); } 60% { transform: translate(-3px, 1px) rotate(0deg); } 70% { transform: translate(2px, 1px) rotate(-1deg); } 80% { transform: translate(-1px, -1px) rotate(1deg); } 90% { transform: translate(2px, 2px) rotate(0deg); } 100% { transform: translate(1px, -2px) rotate(-1deg); } }
+        
+        .global-rainbow { animation: px-rainbow 1s linear infinite !important; }
+        @keyframes px-rainbow { 0% { filter: hue-rotate(0deg) saturate(300%); } 100% { filter: hue-rotate(360deg) saturate(300%); } }
+        
+        .global-upsidedown { transform: rotate(180deg) !important; transition: transform 1s; }
+        
+        .global-mindblown::after { content: "🤯🤯🤯🤯🤯🤯🤯🤯"; position: fixed; top: 0; left: 0; width: 100%; height: 100%; font-size: 100px; display: flex; flex-wrap: wrap; justify-content: center; align-items: center; pointer-events: none; animation: px-rain 2s linear infinite; z-index: 9999; opacity: 0.5; }
+        @keyframes px-rain { 0% { transform: translateY(-100%); } 100% { transform: translateY(100%); } }
+        
+        .global-flash-invert { animation: px-flash 0.2s infinite !important; }
+        @keyframes px-flash { 0% { filter: invert(0); } 100% { filter: invert(1) contrast(200%); } }
+        
+        .global-stretch { animation: px-stretch 1s infinite alternate !important; overflow: hidden !important; }
+        @keyframes px-stretch { 0% { transform: scaleX(1) scaleY(1); } 100% { transform: scaleX(2) scaleY(0.5); } }
+        
+        .global-blackout { filter: brightness(0.05) !important; }
+        
+        .global-crabwalk { animation: px-crab 0.5s infinite alternate linear !important; }
+        @keyframes px-crab { 0% { transform: translateX(-50px); } 100% { transform: translateX(50px); } }
+        
+        .global-explosion { animation: px-explode 2s forwards !important; }
+        @keyframes px-explode { 0% { filter: brightness(1) sepia(0); transform: scale(1); } 10% { filter: brightness(10) sepia(1) hue-rotate(-50deg); transform: scale(1.1); } 20% { filter: brightness(20) contrast(500%); transform: scale(1.2) rotate(5deg); } 100% { filter: brightness(0.2) sepia(1) saturate(500%) hue-rotate(-50deg); transform: scale(0.9) rotate(-2deg); } }
+
+        .global-kyoshiki-murasaki { animation: px-murasaki 3s forwards !important; overflow: hidden !important; }
+        @keyframes px-murasaki { 0% { filter: drop-shadow(0 0 0px purple); } 50% { filter: drop-shadow(0 0 200px purple) brightness(3) sepia(1) hue-rotate(250deg); transform: scale(1.05) rotate(1deg); } 100% { filter: brightness(100) sepia(1) hue-rotate(250deg) saturate(1000%); transform: scale(0) rotate(-10deg); opacity: 0; background: purple; } }
+      `}</style>
+    </div>
+  );
+}
+
+const root = createRoot(document.getElementById('root'));
+root.render(<PotatoxCordApp />);
+</script>
+</body>
+</html>
