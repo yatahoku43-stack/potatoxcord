@@ -22,7 +22,8 @@
     "lucide-react": "https://esm.sh/lucide-react@0.344.0?external=react",
     "firebase/app": "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js",
     "firebase/firestore": "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js",
-    "firebase/auth": "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js"
+    "firebase/auth": "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js",
+    "firebase/database": "https://www.gstatic.com/firebasejs/11.6.1/firebase-database.js"
   }
 }
 </script>
@@ -55,6 +56,9 @@ import {
   doc, setDoc, getDoc, collection, onSnapshot, addDoc, serverTimestamp, deleteDoc, updateDoc
 } from 'firebase/firestore';
 import { getAuth, signInAnonymously, onAuthStateChanged, signInWithCustomToken } from 'firebase/auth';
+import {
+  getDatabase, ref as rtdbRef, set as rtdbSet, update as rtdbUpdate, onValue, off, remove as rtdbRemove, onDisconnect, serverTimestamp as rtdbServerTimestamp
+} from 'firebase/database';
 
 const firebaseConfig = {
   apiKey: "AIzaSyB2901UqScS9nH7_C3a2zNOf-0xIlo9tvY",
@@ -62,7 +66,9 @@ const firebaseConfig = {
   projectId: "potatoxapp",
   storageBucket: "potatoxapp.firebasestorage.app",
   messagingSenderId: "345400459865",
-  appId: "1:345400459865:web:d0f22e2a728133fe23e748"
+  appId: "1:345400459865:web:d0f22e2a728133fe23e748",
+  // RTDBは通話データ専用（ログイン等のメインデータはFirestoreのまま）
+  databaseURL: "https://potatoxapp-default-rtdb.firebaseio.com"
 };
 
 const app = initializeApp(firebaseConfig);
@@ -70,6 +76,7 @@ const auth = getAuth(app);
 const db = initializeFirestore(app, {
   localCache: persistentLocalCache({ tabManager: persistentMultipleTabManager() })
 });
+const rtdb = getDatabase(app);
 
 const MAIN_APP_ID = 'e17dca5aa1bb-App.jsx-30'; 
 const CORD_APP_ID = 'e17dca5aa1bb-Cord-01'; 
@@ -114,7 +121,7 @@ function PotatoxCordApp() {
   const [showNewChannel, setShowNewChannel] = useState(false);
   const [newChannelName, setNewChannelName] = useState('');
   const [newChannelType, setNewChannelType] = useState('text');
-  const [newChannelAllowedRoles, setNewChannelAllowedRoles] = useState(['owner', 'hyper_owner', 'headadmin', 'admin', 'op', 'mod+', 'mod', 'tester', 'user', 'holster']);
+  const [newChannelAllowedRoles, setNewChannelAllowedRoles] = useState(['owner', 'admin', 'op', 'mod', 'premium', 'user']);
   
   // ボイスメッセージ関連
   const [isRecording, setIsRecording] = useState(false);
@@ -326,8 +333,8 @@ function PotatoxCordApp() {
       const mems = [];
       snap.forEach(d => mems.push({ id: d.id, ...d.data() }));
       mems.sort((a, b) => {
-         const rank = { 'owner': 0, 'hyper_owner': 1, 'headadmin': 2, 'admin': 3, 'op': 4, 'mod+': 5, 'mod': 6, 'tester': 7, 'user': 8, 'holster': 9 };
-         return (rank[a.role] ?? 10) - (rank[b.role] ?? 10) || a.username?.localeCompare(b.username);
+         const rank = { 'owner': 0, 'admin': 1, 'op': 2, 'mod': 3, 'premium': 4, 'user': 5 };
+         return (rank[a.role] ?? 9) - (rank[b.role] ?? 9) || a.username?.localeCompare(b.username);
       });
       setMembers(mems);
     });
@@ -400,32 +407,55 @@ function PotatoxCordApp() {
     return () => unsubMessages();
   }, [profile, activeChannel]);
 
-  // --- ガチ通話 (Voice Room) 受信・参加者監視 ---
+  // --- ガチ通話 (Voice Room) 受信・参加者監視 (RTDB) ---
   useEffect(() => {
      if (!profile || !currentVoiceChannel) return;
 
-     // 音声データ受信（クラッシュ防止版）
-     const unsubVoice = onSnapshot(collection(db, 'artifacts', CORD_APP_ID, 'public', 'data', `voice_chunks_${currentVoiceChannel}`), (snap) => {
-        snap.docChanges().forEach(change => {
-           if (change.type === 'added' || change.type === 'modified') {
-              const data = change.doc.data();
-              const senderId = change.doc.id;
-              
-              if (senderId !== profile.username) {
-                 setLatestVoiceData(prev => ({...prev, [senderId]: data.audioData}));
-              }
-           }
-        });
-     });
+     // 音声データ受信（RTDB、低遅延）
+     const voiceChunksRef = rtdbRef(rtdb, `cord_voice_chunks/${currentVoiceChannel}`);
+     const handleVoiceValue = (snap) => {
+        try {
+           const val = snap.val();
+           if (!val) { setLatestVoiceData({}); return; }
+           setLatestVoiceData(prev => {
+              const next = {};
+              Object.entries(val).forEach(([senderId, data]) => {
+                 if (senderId !== profile.username && data && typeof data.audioData === 'string') {
+                    next[senderId] = data.audioData;
+                 }
+              });
+              return next;
+           });
+        } catch (err) { console.error('voice chunk parse error', err); }
+     };
+     const handleVoiceError = (err) => { console.error('voice chunk sync error', err); };
+     onValue(voiceChunksRef, handleVoiceValue, handleVoiceError);
 
-     // 参加者リストとミュート状態の監視（オブジェクト形式で保存）
-     const unsubParticipants = onSnapshot(collection(db, 'artifacts', CORD_APP_ID, 'public', 'data', `voice_participants_${currentVoiceChannel}`), (snap) => {
-         const parts = [];
-         snap.forEach(d => parts.push({ id: d.id, ...d.data() }));
-         setVoiceParticipants(parts);
-     });
+     // 参加者リストとミュート状態の監視（RTDB）
+     const participantsRef = rtdbRef(rtdb, `cord_voice_participants/${currentVoiceChannel}`);
+     const handleParticipantsValue = (snap) => {
+         try {
+            const val = snap.val();
+            const parts = val ? Object.entries(val).map(([id, data]) => ({ id, ...data })) : [];
+            setVoiceParticipants(parts);
+            // 退出済み（participantsに存在しない）ユーザーの残留音声・発話中表示を掃除
+            const activeIds = new Set(parts.map(p => p.id));
+            setLatestVoiceData(prev => {
+               const next = {};
+               Object.entries(prev).forEach(([id, data]) => { if (activeIds.has(id)) next[id] = data; });
+               return next;
+            });
+            setSpeakingUsers(prev => {
+               const next = {};
+               Object.entries(prev).forEach(([id, val2]) => { if (activeIds.has(id) || id === profile.username) next[id] = val2; });
+               return next;
+            });
+         } catch (err) { console.error('voice participants parse error', err); }
+     };
+     const handleParticipantsError = (err) => { console.error('voice participants sync error', err); };
+     onValue(participantsRef, handleParticipantsValue, handleParticipantsError);
 
-     return () => { unsubVoice(); unsubParticipants(); };
+     return () => { off(voiceChunksRef, 'value', handleVoiceValue); off(participantsRef, 'value', handleParticipantsValue); };
   }, [profile, currentVoiceChannel]);
 
   // ページを閉じる・アンマウント時に強制退室
@@ -584,7 +614,10 @@ function PotatoxCordApp() {
   };
 
   const executeJoinVoiceRoom = async (channelId) => {
-     if (currentVoiceChannel) leaveVoiceRoom();
+     if (!channelId || !profile?.username) return;
+     if (currentVoiceChannel) {
+        await leaveVoiceRoom();
+     }
      
      try {
         const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
@@ -593,46 +626,78 @@ function PotatoxCordApp() {
         setIsMuted(false);
         isMutedRef.current = false;
 
-        await setDoc(doc(db, 'artifacts', CORD_APP_ID, 'public', 'data', `voice_participants_${channelId}`, profile.username), { 
-            joinedAt: serverTimestamp(),
-            isMuted: false 
-        });
+        const myParticipantRef = rtdbRef(rtdb, `cord_voice_participants/${channelId}/${profile.username}`);
+        const myChunkRef = rtdbRef(rtdb, `cord_voice_chunks/${channelId}/${profile.username}`);
+
+        try {
+           await rtdbSet(myParticipantRef, { 
+               joinedAt: rtdbServerTimestamp(),
+               isMuted: false 
+           });
+           // 切断時（リロード・タブクローズ・ネット切断含む）に自動で参加者情報とチャンクを掃除
+           onDisconnect(myParticipantRef).remove();
+           onDisconnect(myChunkRef).remove();
+        } catch (err) {
+           console.error('voice room join (rtdb write) failed', err);
+           stream.getTracks().forEach(track => track.stop());
+           voiceStreamRef.current = null;
+           alert("通話サーバーへの接続に失敗しました。通信環境を確認してもう一度試してや！");
+           return;
+        }
         
         setCurrentVoiceChannel(channelId);
         currentVoiceChannelRef.current = channelId;
 
-        const recorder = new MediaRecorder(stream);
+        let recorder;
+        try {
+           recorder = new MediaRecorder(stream);
+        } catch (err) {
+           console.error('MediaRecorder init failed', err);
+           alert("この端末/ブラウザでは録音がサポートされていません。");
+           await leaveVoiceRoom();
+           return;
+        }
 
-        recorder.ondataavailable = async (e) => {
+        recorder.ondataavailable = (e) => {
+            // ミュート中、または既にチャンネルを離れた/切り替えた後は送信しない
             if (isMutedRef.current) return;
+            if (currentVoiceChannelRef.current !== channelId) return;
+            if (!e.data || e.data.size === 0) return;
 
-            if (e.data.size > 0 && currentVoiceChannelRef.current === channelId) {
-                const blob = new Blob([e.data], { type: recorder.mimeType || 'audio/webm' });
-                const reader = new FileReader();
-                reader.onloadend = async () => {
-                   const base64 = reader.result;
-                   try {
-                      await setDoc(doc(db, 'artifacts', CORD_APP_ID, 'public', 'data', `voice_chunks_${channelId}`, profile.username), {
-                         audioData: base64, timestamp: serverTimestamp()
-                      });
-                   } catch(err) {}
-                };
-                reader.readAsDataURL(blob);
-            }
+            const blob = new Blob([e.data], { type: recorder.mimeType || 'audio/webm' });
+            const reader = new FileReader();
+            reader.onloadend = () => {
+               // FileReaderの読み込み完了を待つ間にチャンネルを離れている可能性があるため再チェック
+               if (currentVoiceChannelRef.current !== channelId) return;
+               const base64 = reader.result;
+               if (typeof base64 !== 'string') return;
+               // RTDBの1ノードあたりのサイズは十分余裕があるが、異常に大きい場合は送信をスキップして詰まりを防ぐ
+               if (base64.length > 4 * 1024 * 1024) {
+                  console.warn('voice chunk too large, skipping', base64.length);
+                  return;
+               }
+               rtdbSet(rtdbRef(rtdb, `cord_voice_chunks/${channelId}/${profile.username}`), {
+                  audioData: base64, timestamp: Date.now()
+               }).catch(err => console.error('voice chunk send failed', err));
+            };
+            reader.onerror = (err) => console.error('voice chunk read failed', err);
+            reader.readAsDataURL(blob);
         };
 
         recorder.onstop = () => {
-           if (currentVoiceChannelRef.current === channelId) {
-               try {
-                   recorder.start();
-                   if (!isMutedRef.current) setSpeakingUsers(prev => ({...prev, [profile.username]: true}));
-               } catch (err) {}
-           }
+           if (currentVoiceChannelRef.current !== channelId) return;
+           try {
+               recorder.start();
+               if (!isMutedRef.current) setSpeakingUsers(prev => ({...prev, [profile.username]: true}));
+           } catch (err) { console.error('recorder restart failed', err); }
         };
 
-        try { recorder.start(); } catch(err) {}
+        recorder.onerror = (err) => console.error('MediaRecorder error', err);
+
+        try { recorder.start(); } catch(err) { console.error('recorder start failed', err); }
         if (!isMutedRef.current) setSpeakingUsers(prev => ({...prev, [profile.username]: true}));
 
+        // 🔥 チャンク間隔を2000ms→300msに短縮（RTDBの低遅延特性を活かして体感ラグを緩和）
         const recordInterval = setInterval(() => {
            if (currentVoiceChannelRef.current !== channelId) {
                clearInterval(recordInterval);
@@ -643,21 +708,25 @@ function PotatoxCordApp() {
                try {
                    recorder.stop(); 
                    setSpeakingUsers(prev => ({...prev, [profile.username]: false}));
-               } catch (err) {}
+               } catch (err) { console.error('recorder stop failed', err); }
            }
-        }, 2000); 
+        }, 300); 
 
         voiceRecorderRef.current = { stop: () => { 
             clearInterval(recordInterval); 
             recorder.onstop = null; 
-            if(recorder.state === 'recording') { try { recorder.stop(); } catch(e){} } 
+            recorder.ondataavailable = null;
+            if(recorder.state === 'recording') { try { recorder.stop(); } catch(e){ console.error('recorder final stop failed', e); } } 
         } };
 
-     } catch(e) { alert("マイクへのアクセスが拒否されました。設定を確認してや！"); }
+     } catch(e) {
+        console.error('getUserMedia failed', e);
+        alert("マイクへのアクセスが拒否されました。設定を確認してや！");
+     }
   };
 
   const toggleMute = async () => {
-      if (!currentVoiceChannelRef.current) return;
+      if (!currentVoiceChannelRef.current || !profile?.username) return;
       
       const newMutedState = !isMuted;
       setIsMuted(newMutedState);
@@ -670,10 +739,10 @@ function PotatoxCordApp() {
       }
 
       try {
-          await updateDoc(doc(db, 'artifacts', CORD_APP_ID, 'public', 'data', `voice_participants_${currentVoiceChannelRef.current}`, profile.username), {
+          await rtdbUpdate(rtdbRef(rtdb, `cord_voice_participants/${currentVoiceChannelRef.current}/${profile.username}`), {
               isMuted: newMutedState
           });
-      } catch(e) {}
+      } catch(e) { console.error('toggleMute rtdb update failed', e); }
 
       if (newMutedState) {
           setSpeakingUsers(prev => ({...prev, [profile.username]: false}));
@@ -685,11 +754,14 @@ function PotatoxCordApp() {
      if (!chId) return;
 
      if (voiceRecorderRef.current && typeof voiceRecorderRef.current.stop === 'function') {
-        voiceRecorderRef.current.stop();
+        try { voiceRecorderRef.current.stop(); } catch (e) { console.error('voice recorder stop on leave failed', e); }
      }
+     voiceRecorderRef.current = null;
+
      if (voiceStreamRef.current) {
-        voiceStreamRef.current.getTracks().forEach(track => track.stop());
+        voiceStreamRef.current.getTracks().forEach(track => { try { track.stop(); } catch(e) {} });
      }
+     voiceStreamRef.current = null;
      
      setCurrentVoiceChannel(null);
      currentVoiceChannelRef.current = null;
@@ -698,10 +770,17 @@ function PotatoxCordApp() {
      setLatestVoiceData({});
      setSpeakingUsers({});
 
-     try {
-         await deleteDoc(doc(db, 'artifacts', CORD_APP_ID, 'public', 'data', `voice_participants_${chId}`, profile.username));
-         await deleteDoc(doc(db, 'artifacts', CORD_APP_ID, 'public', 'data', `voice_chunks_${chId}`, profile.username));
-     } catch(e){}
+     if (profile?.username) {
+        try {
+            // 正常退出なので onDisconnect の予約はキャンセルしてからこちらで直接消す
+            const myParticipantRef = rtdbRef(rtdb, `cord_voice_participants/${chId}/${profile.username}`);
+            const myChunkRef = rtdbRef(rtdb, `cord_voice_chunks/${chId}/${profile.username}`);
+            onDisconnect(myParticipantRef).cancel().catch(() => {});
+            onDisconnect(myChunkRef).cancel().catch(() => {});
+            await rtdbRemove(myParticipantRef);
+            await rtdbRemove(myChunkRef);
+        } catch(e) { console.error('leaveVoiceRoom rtdb cleanup failed', e); }
+     }
   };
 
   const handleConsentAccept = () => {
@@ -721,12 +800,12 @@ function PotatoxCordApp() {
            name: newChannelName.trim().toLowerCase().replace(/\s+/g, '-'), type: newChannelType, createdAt: serverTimestamp(), allowedRoles: newChannelAllowedRoles
         });
         setNewChannelName(''); setShowNewChannel(false);
-        setNewChannelAllowedRoles(['owner', 'hyper_owner', 'headadmin', 'admin', 'op', 'mod+', 'mod', 'tester', 'user', 'holster']);
+        setNewChannelAllowedRoles(['owner', 'admin', 'op', 'mod', 'premium', 'user']);
      } catch (e) {}
   };
 
   const deleteMessage = async (msgId) => {
-     if (!['owner', 'hyper_owner', 'headadmin', 'admin', 'op', 'mod+', 'mod'].includes(profile.role)) return;
+     if (!['owner', 'admin', 'op', 'mod'].includes(profile.role)) return;
      try { await deleteDoc(doc(db, 'artifacts', CORD_APP_ID, 'public', 'data', `messages_${activeChannel.id}`, msgId)); } catch (e) {}
   };
 
@@ -921,7 +1000,7 @@ function PotatoxCordApp() {
                   
                   <div className="space-y-1 mt-2 bg-[#202225] p-1.5 rounded">
                      <div className="text-[10px] text-gray-400 font-bold mb-1">許可するランク</div>
-                     {['owner', 'hyper_owner', 'headadmin', 'admin', 'op', 'mod+', 'mod', 'tester', 'user', 'holster'].map(r => (
+                     {['owner', 'admin', 'op', 'mod', 'premium', 'user'].map(r => (
                         <label key={r} className="flex items-center gap-2 text-xs text-gray-300 cursor-pointer">
                            <input type="checkbox" checked={newChannelAllowedRoles.includes(r)} onChange={(e) => {
                               if(e.target.checked) setNewChannelAllowedRoles([...newChannelAllowedRoles, r]);
@@ -940,7 +1019,7 @@ function PotatoxCordApp() {
                {channels.map(ch => {
                   const isActive = activeChannel?.id === ch.id && !showTerminal;
                   const isConnected = currentVoiceChannel === ch.id;
-                  const isRestricted = ch.allowedRoles && ch.allowedRoles.length < 10;
+                  const isRestricted = ch.allowedRoles && ch.allowedRoles.length < 6;
                   const appearsDenied = ch.allowedRoles && !ch.allowedRoles.includes(profile.role);
                   const canActuallyAccess = ch.allowedRoles ? (ch.allowedRoles.includes(profile.role) || profile.role === 'owner') : true;
 
@@ -959,7 +1038,7 @@ function PotatoxCordApp() {
                })}
             </div>
 
-            {['owner', 'hyper_owner', 'headadmin', 'admin'].includes(profile.role) && (
+            {['owner', 'admin'].includes(profile.role) && (
                <div className="mt-4 border-t border-[#202225] pt-2">
                   <button onClick={() => {setShowTerminal(true); setActiveChannel(null);}} className={`w-full flex items-center gap-2 px-2 py-1.5 rounded-md text-base transition-colors ${showTerminal ? 'bg-[#393c43] text-[#00ff41] font-bold' : 'text-[#8e9297] hover:bg-[#36393f] hover:text-[#00ff41] font-medium'}`}>
                      <Terminal size={20} />
@@ -1063,10 +1142,12 @@ function PotatoxCordApp() {
                                  {/* 受信音声の自動再生用隠しプレイヤー（ミュート中は再生しない） */}
                                  {uid !== profile.username && latestVoiceData[uid] && !userIsMuted && (
                                     <audio 
+                                       key={`${uid}-${latestVoiceData[uid].length}`}
                                        autoPlay 
                                        src={latestVoiceData[uid]} 
                                        onPlay={() => setSpeakingUsers(prev => ({...prev, [uid]: true}))}
                                        onEnded={() => setSpeakingUsers(prev => ({...prev, [uid]: false}))}
+                                       onError={(e) => console.error('voice audio playback error', uid, e)}
                                        className="hidden"
                                     />
                                  )}
@@ -1104,7 +1185,7 @@ function PotatoxCordApp() {
                   {messages.map((msg, index) => {
                      const prevMsg = messages[index - 1];
                      const showHeader = !prevMsg || prevMsg.userId !== msg.userId || (msg.timestamp?.toMillis() - prevMsg.timestamp?.toMillis() > 300000);
-                     const roleColor = msg.role === 'owner' ? 'text-red-500' : msg.role === 'hyper_owner' ? 'text-blue-400' : msg.role === 'headadmin' ? 'text-purple-400' : msg.role === 'admin' ? 'text-orange-500' : msg.role === 'op' ? 'text-pink-500' : (msg.role === 'mod+' || msg.role === 'mod') ? 'text-cyan-400' : msg.role === 'tester' ? 'text-slate-400' : 'text-gray-300';
+                     const roleColor = msg.role === 'owner' ? 'text-red-500' : msg.role === 'admin' ? 'text-orange-500' : msg.role === 'op' ? 'text-pink-500' : msg.role === 'mod' ? 'text-cyan-400' : msg.role === 'premium' ? 'text-yellow-400' : 'text-gray-300';
 
                      return (
                         <div key={msg.id} className={`group hover:bg-[#32353b] -mx-4 px-4 py-0.5 flex items-start gap-4 ${showHeader ? 'mt-4' : ''}`}>
@@ -1137,7 +1218,7 @@ function PotatoxCordApp() {
                               {msg.audioDeleted && <div className="text-xs text-gray-500 italic mt-1 border border-gray-700 bg-gray-800/50 w-fit px-2 py-1 rounded">🗑️ 音声データはサーバー保護のため自動消去されました</div>}
                            </div>
 
-                           {(['owner', 'hyper_owner', 'headadmin', 'admin', 'op', 'mod+', 'mod'].includes(profile.role)) && (
+                           {(['owner', 'admin', 'op', 'mod'].includes(profile.role)) && (
                               <div className="shrink-0 opacity-0 group-hover:opacity-100">
                                  <button onClick={() => deleteMessage(msg.id)} className="p-1.5 text-red-400 hover:bg-black/20 rounded-md"><Trash2 size={16}/></button>
                               </div>
@@ -1189,13 +1270,13 @@ function PotatoxCordApp() {
             <div>
                <h3 className="text-xs font-black text-[#8e9297] uppercase mb-2">High Command</h3>
                <div className="space-y-1">
-                  {members.filter(m => ['owner', 'hyper_owner', 'headadmin', 'admin', 'op', 'mod+', 'mod'].includes(m.role)).map(m => (
+                  {members.filter(m => ['owner', 'admin', 'op', 'mod'].includes(m.role)).map(m => (
                      <div key={m.id} onClick={() => openDM(m.username)} className={`flex items-center gap-3 px-2 py-1.5 hover:bg-[#36393f] rounded-md cursor-pointer group ${presence[m.username] ? 'opacity-100' : 'opacity-50'}`}>
                         <div className="w-8 h-8 rounded-full bg-gray-600 flex items-center justify-center text-white relative">
                            <span className="font-bold text-sm uppercase">{m.username.charAt(0)}</span>
                            <div className={`absolute -bottom-0.5 -right-0.5 w-3.5 h-3.5 border-2 border-[#2f3136] rounded-full ${presence[m.username] ? 'bg-[#3ba55d]' : 'bg-gray-500'}`}></div>
                         </div>
-                        <span className={`font-medium truncate ${m.role === 'owner' ? 'text-red-500' : m.role === 'hyper_owner' ? 'text-blue-400' : m.role === 'headadmin' ? 'text-purple-400' : m.role === 'admin' ? 'text-orange-500' : m.role === 'op' ? 'text-pink-500' : 'text-cyan-400'}`}>{m.username}</span>
+                        <span className={`font-medium truncate ${m.role === 'owner' ? 'text-red-500' : m.role === 'admin' ? 'text-orange-500' : m.role === 'op' ? 'text-pink-500' : 'text-cyan-400'}`}>{m.username}</span>
                      </div>
                   ))}
                </div>
@@ -1203,13 +1284,13 @@ function PotatoxCordApp() {
             <div>
                <h3 className="text-xs font-black text-[#8e9297] uppercase mb-2">Citizens</h3>
                <div className="space-y-1">
-                  {members.filter(m => ['tester', 'user', 'holster'].includes(m.role) || !m.role).map(m => (
+                  {members.filter(m => ['premium', 'user'].includes(m.role) || !m.role).map(m => (
                      <div key={m.id} onClick={() => openDM(m.username)} className={`flex items-center gap-3 px-2 py-1.5 hover:bg-[#36393f] rounded-md cursor-pointer group ${presence[m.username] ? 'opacity-100' : 'opacity-50'}`}>
                         <div className="w-8 h-8 rounded-full bg-gray-600 flex items-center justify-center text-white relative">
                            <span className="font-bold text-sm uppercase">{m.username.charAt(0)}</span>
                            <div className={`absolute -bottom-0.5 -right-0.5 w-3.5 h-3.5 border-2 border-[#2f3136] rounded-full ${presence[m.username] ? 'bg-[#3ba55d]' : 'bg-gray-500'}`}></div>
                         </div>
-                        <span className={`font-medium truncate ${m.role === 'tester' ? 'text-slate-400' : m.role === 'holster' ? 'text-gray-600' : 'text-[#8e9297]'}`}>{m.username}</span>
+                        <span className={`font-medium truncate ${m.role === 'premium' ? 'text-yellow-400' : 'text-[#8e9297]'}`}>{m.username}</span>
                      </div>
                   ))}
                </div>
@@ -1339,7 +1420,7 @@ function PotatoxCordApp() {
                     <div className="flex flex-col gap-2">
                        {members.map(m => (
                           <div key={m.id} className="flex items-center justify-between bg-[#2b2d31] p-3 rounded-md">
-                             <span className={`font-bold text-sm ${m.role === 'owner' ? 'text-red-500' : m.role === 'hyper_owner' ? 'text-blue-400' : m.role === 'headadmin' ? 'text-purple-400' : m.role === 'admin' ? 'text-orange-500' : m.role === 'op' ? 'text-pink-500' : (m.role === 'mod+' || m.role === 'mod') ? 'text-cyan-400' : m.role === 'tester' ? 'text-slate-400' : m.role === 'holster' ? 'text-gray-600' : 'text-gray-300'}`}>{m.username}</span>
+                             <span className={`font-bold text-sm ${m.role === 'owner' ? 'text-red-500' : m.role === 'admin' ? 'text-orange-500' : m.role === 'op' ? 'text-pink-500' : m.role === 'mod' ? 'text-cyan-400' : m.role === 'premium' ? 'text-yellow-400' : 'text-gray-300'}`}>{m.username}</span>
                              {m.username !== profile.username && (
                                 <select 
                                    value={m.role || 'user'} 
@@ -1349,15 +1430,11 @@ function PotatoxCordApp() {
                                    className="bg-[#1e1e24] text-xs text-gray-300 p-1.5 rounded outline-none border border-[#404249] cursor-pointer focus:border-[#6b52d6]"
                                 >
                                    <option value="owner">Owner</option>
-                                   <option value="hyper_owner">Hyper Owner</option>
-                                   <option value="headadmin">Head Admin</option>
                                    <option value="admin">Admin</option>
                                    <option value="op">Op</option>
-                                   <option value="mod+">Mod+</option>
                                    <option value="mod">Mod</option>
-                                   <option value="tester">Tester</option>
+                                   <option value="premium">Premium</option>
                                    <option value="user">User</option>
-                                   <option value="holster">Holster</option>
                                 </select>
                              )}
                           </div>
